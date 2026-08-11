@@ -9,7 +9,7 @@
 import { openDb, saveDb } from './db.js';
 import { twitterBookmarksIndexPath } from './paths.js';
 import type { ResolvedEngine } from './engine.js';
-import { invokeEngine, invokeEngineAsync } from './engine.js';
+import { EngineInvocationError, invokeEngine, invokeEngineAsync } from './engine.js';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -17,12 +17,15 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const BATCH_SIZE = 50;
-const DOMAIN_BATCH_SIZE = 200;
+const DOMAIN_BATCH_SIZE = 100;
 const DOMAIN_INITIAL_CONCURRENCY = 20;
 const DOMAIN_ABSOLUTE_MAX_CONCURRENCY = 60;
 const DOMAIN_RESOURCE_LIMIT = 0.8;
 const DOMAIN_TUNE_INTERVAL_MS = 1_000;
-const DOMAIN_MAX_ATTEMPTS = 2;
+const DOMAIN_MAX_ATTEMPTS = 3;
+const DOMAIN_HEALTHY_BATCH_SEC = 90;
+const DOMAIN_CONGESTION_COOLDOWN_MS = 30_000;
+const DOMAIN_CONGESTION_DECREASE_INTERVAL_MS = 5_000;
 const DOMAIN_OUTPUT_SCHEMA = fileURLToPath(new URL('./domain-classification.schema.json', import.meta.url));
 
 interface UnclassifiedBookmark {
@@ -288,6 +291,104 @@ function numericEnv(name: string, fallback: number, min: number, max: number): n
   return Number.isFinite(value) ? Math.max(min, Math.min(max, Math.floor(value))) : fallback;
 }
 
+export type DomainFailureReason =
+  | 'timeout'
+  | 'throttle'
+  | 'invalid-response'
+  | 'engine'
+  | 'storage'
+  | 'unexpected';
+
+export type DomainFailureCounts = Record<DomainFailureReason, number>;
+
+const STORAGE_FAILURE_CODES = new Set([
+  'EACCES', 'EBUSY', 'EDQUOT', 'EIO', 'EISDIR', 'ENOSPC', 'ENOTDIR', 'EPERM', 'EROFS',
+]);
+
+function emptyDomainFailureCounts(): DomainFailureCounts {
+  return {
+    timeout: 0,
+    throttle: 0,
+    'invalid-response': 0,
+    engine: 0,
+    storage: 0,
+    unexpected: 0,
+  };
+}
+
+export function classifyDomainFailure(error: unknown): DomainFailureReason {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/(?:429|rate.?limit|too many requests|capacity)/i.test(message)) return 'throttle';
+  if (error instanceof EngineInvocationError) {
+    if (error.reason === 'timeout') return 'timeout';
+    if (error.reason === 'maxbuffer') return 'invalid-response';
+    return 'engine';
+  }
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String((error as NodeJS.ErrnoException).code ?? '').toUpperCase()
+    : '';
+  if (STORAGE_FAILURE_CODES.has(code)) return 'storage';
+  if (/timed out|timeout/i.test(message)) return 'timeout';
+  if (/domain response|json object|result array|parse|syntax/i.test(message)) return 'invalid-response';
+  if (/database|sqlite|disk|readonly|read-only|i\/o|fsync|permission denied|operation not permitted|no space left|quota exceeded/i.test(message)) return 'storage';
+  return 'unexpected';
+}
+
+export function reduceDomainConcurrencyForFailure(
+  targetConcurrency: number,
+  reason: DomainFailureReason,
+): number {
+  const current = Math.max(1, Math.floor(targetConcurrency));
+  if (!['timeout', 'throttle', 'invalid-response', 'engine'].includes(reason)) return current;
+  const factor = reason === 'timeout' ? 0.5 : 0.75;
+  return Math.max(1, Math.floor(current * factor));
+}
+
+export interface DomainConcurrencyUpdate {
+  targetConcurrency: number;
+  phase: 'resource guard' | 'auto-tuning' | '';
+  overResourceLimit: boolean;
+}
+
+export function getDomainConcurrencyUpdate(input: {
+  targetConcurrency: number;
+  activeWorkers: number;
+  concurrencyCap: number;
+  cpuUsedPct: number;
+  memoryUsedPct: number;
+  resourceLimitPct: number;
+  cooldownActive: boolean;
+  healthyCompletions: number;
+  avgHealthyBatchSec: number;
+}): DomainConcurrencyUpdate {
+  const current = Math.max(1, Math.floor(input.targetConcurrency));
+  const cap = Math.max(1, Math.floor(input.concurrencyCap));
+  const overResourceLimit = input.cpuUsedPct >= input.resourceLimitPct
+    || input.memoryUsedPct >= input.resourceLimitPct;
+
+  if (overResourceLimit) {
+    return {
+      targetConcurrency: Math.max(1, Math.min(current, cap, Math.floor(Math.max(1, input.activeWorkers) * 0.8))),
+      phase: 'resource guard',
+      overResourceLimit,
+    };
+  }
+
+  if (current > cap) {
+    return { targetConcurrency: cap, phase: 'resource guard', overResourceLimit };
+  }
+
+  const completionsRequired = Math.max(10, current);
+  const healthyService = input.healthyCompletions >= completionsRequired
+    && input.avgHealthyBatchSec > 0
+    && input.avgHealthyBatchSec <= DOMAIN_HEALTHY_BATCH_SEC;
+  if (!input.cooldownActive && healthyService && input.memoryUsedPct < 75 && input.cpuUsedPct < 70 && current < cap) {
+    return { targetConcurrency: current + 1, phase: 'auto-tuning', overResourceLimit };
+  }
+
+  return { targetConcurrency: current, phase: '', overResourceLimit };
+}
+
 function availableMemoryRatio(): number {
   if (process.platform === 'darwin') {
     try {
@@ -326,6 +427,7 @@ export interface DomainConcurrencyPlan {
   cap: number;
   configuredMax: number;
   configuredInitial: number;
+  preferredConcurrency: number;
   minimumConcurrency: number;
   serviceCap: number;
   workerMemoryMb: number;
@@ -349,14 +451,17 @@ export function getDomainConcurrencyPlan(input: {
   const memoryHeadroom = Math.max(0, (freeRatio - (1 - DOMAIN_RESOURCE_LIMIT)) * totalMemory);
   const memoryCap = Math.max(1, Math.floor(memoryHeadroom / (workerMemoryMb * 1024 * 1024)));
   const cpuCap = Math.max(1, Math.floor(cpuCount * 6));
-  const minimumConcurrency = Math.max(1, Math.min(configuredInitial, configuredMax, serviceCap, cpuCap));
+  const minimumConcurrency = 1;
+  const preferredConcurrency = Math.max(1, Math.min(configuredInitial, configuredMax, serviceCap, cpuCap));
   const cap = Math.max(minimumConcurrency, Math.min(configuredMax, serviceCap, memoryCap, cpuCap));
+  const launchInitial = Math.min(preferredConcurrency, cap);
   return {
-    initial: minimumConcurrency,
-    launchInitial: minimumConcurrency,
+    initial: launchInitial,
+    launchInitial,
     cap,
     configuredMax,
     configuredInitial,
+    preferredConcurrency,
     minimumConcurrency,
     serviceCap,
     workerMemoryMb,
@@ -375,6 +480,8 @@ export interface DomainClassifyResult extends LlmClassifyResult {
   peakConcurrency: number;
   concurrencyCap: number;
   throttleEvents: number;
+  failureCounts: DomainFailureCounts;
+  lastError: string;
   maxCpuUsedPct: number;
   maxMemoryUsedPct: number;
   resourceLimitPct: number;
@@ -409,6 +516,7 @@ export interface DomainProgress {
   maxCpuUsedPct: number;
   maxMemoryUsedPct: number;
   throttleEvents: number;
+  failureCounts: DomainFailureCounts;
   resourceLimitPct: number;
   batchIndex: number;
   batchSizeUsed: number;
@@ -435,7 +543,9 @@ function appendDomainRunLog(dbPath: string, result: DomainClassifyResult): Domai
       itemsPerMin: result.elapsedSec > 0 ? (result.classified / result.elapsedSec) * 60 : 0,
       initialConcurrency: result.initialConcurrency, finalConcurrency: result.finalConcurrency,
       peakConcurrency: result.peakConcurrency, concurrencyCap: result.concurrencyCap,
-      throttleEvents: result.throttleEvents, maxCpuUsedPct: result.maxCpuUsedPct,
+      throttleEvents: result.throttleEvents, failureCounts: result.failureCounts,
+      lastError: result.lastError.replace(/\s+/g, ' ').trim().slice(0, 500),
+      maxCpuUsedPct: result.maxCpuUsedPct,
       maxMemoryUsedPct: result.maxMemoryUsedPct,
       resourceLimitPct: result.resourceLimitPct,
       resourceConstrained: result.resourceConstrained,
@@ -590,6 +700,8 @@ export async function classifyDomainsWithLlm(options: {
   const { engine } = options;
   const domainEngine = optimizedDomainEngine(engine);
   const plan = getDomainConcurrencyPlan();
+  const domainBatchSize = numericEnv('FT_DOMAIN_BATCH_SIZE', DOMAIN_BATCH_SIZE, 25, 200);
+  const domainTimeoutMs = numericEnv('FT_DOMAIN_TIMEOUT_MS', 180_000, 1_000, 600_000);
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
   let runtime: IsolatedCodexRuntime | null = null;
@@ -598,10 +710,11 @@ export async function classifyDomainsWithLlm(options: {
     engine: label, totalUnclassified: 0, classified: 0, failed: 0, batches: 0,
     prefilled: 0, concurrency: 0, initialConcurrency: plan.initial,
     finalConcurrency: 0, peakConcurrency: 0, concurrencyCap: plan.cap,
-    throttleEvents: 0, maxCpuUsedPct: 0, maxMemoryUsedPct: plan.memoryUsedPct,
+    throttleEvents: 0, failureCounts: emptyDomainFailureCounts(), lastError: '',
+    maxCpuUsedPct: 0, maxMemoryUsedPct: plan.memoryUsedPct,
     resourceLimitPct: plan.resourceLimitPct,
     resourceConstrained: plan.memoryUsedPct >= plan.resourceLimitPct,
-    batchSizeStart: DOMAIN_BATCH_SIZE, batchSizeEnd: DOMAIN_BATCH_SIZE,
+    batchSizeStart: domainBatchSize, batchSizeEnd: domainBatchSize,
     avgSecPerBatch: 0, avgSecPerItem: 0, elapsedSec: 0,
   });
 
@@ -656,17 +769,22 @@ export async function classifyDomainsWithLlm(options: {
     let concurrencyCap = plan.cap;
     let peakConcurrency = 0;
     let throttleEvents = 0;
+    const failureCounts = emptyDomainFailureCounts();
+    let lastError = '';
     let memoryUsedPct = plan.memoryUsedPct;
     let cpuUsedPct = 0;
     let maxMemoryUsedPct = memoryUsedPct;
     let maxCpuUsedPct = 0;
     let resourceConstrained = memoryUsedPct >= DOMAIN_RESOURCE_LIMIT * 100;
     let cooldownUntil = 0;
+    let lastCongestionDecreaseAt = 0;
+    let healthyCompletions = 0;
+    let healthyBatchMs = 0;
     let previousCpu = cpuSnapshot();
     const startedAt = Date.now();
     const jobs: DomainJob[] = [];
-    for (let i = 0; i < bookmarks.length; i += DOMAIN_BATCH_SIZE) {
-      jobs.push({ batch: bookmarks.slice(i, i + DOMAIN_BATCH_SIZE), attempt: 1 });
+    for (let i = 0; i < bookmarks.length; i += domainBatchSize) {
+      jobs.push({ batch: bookmarks.slice(i, i + domainBatchSize), attempt: 1 });
     }
     let nextJob = 0;
 
@@ -680,14 +798,16 @@ export async function classifyDomainsWithLlm(options: {
         classified, failed, elapsedSec,
         etaSec: llmRate > 0 ? (bookmarks.length - llmProcessed) * llmRate : 0,
         itemsPerMin: elapsedSec > 0 ? (llmProcessed / elapsedSec) * 60 : 0,
-        successBatches, nextBatchSize: DOMAIN_BATCH_SIZE, cpuUsedPct, memoryUsedPct,
+        successBatches, nextBatchSize: domainBatchSize, cpuUsedPct, memoryUsedPct,
         maxCpuUsedPct, maxMemoryUsedPct, throttleEvents,
+        failureCounts: { ...failureCounts },
         resourceLimitPct: DOMAIN_RESOURCE_LIMIT * 100, ...info,
+        lastError: info.lastError || lastError,
       };
       try { options.onBatch?.(progress); } catch { /* observational */ }
     };
 
-    const sampleResources = (allowRaise: boolean): void => {
+    const sampleResources = (): DomainConcurrencyUpdate['phase'] => {
       const freeRatio = availableMemoryRatio();
       memoryUsedPct = (1 - freeRatio) * 100;
       const nextCpu = cpuSnapshot();
@@ -697,19 +817,48 @@ export async function classifyDomainsWithLlm(options: {
       maxCpuUsedPct = Math.max(maxCpuUsedPct, cpuUsedPct);
       const memoryHeadroom = Math.max(0, (freeRatio - (1 - DOMAIN_RESOURCE_LIMIT)) * os.totalmem());
       const additionalWorkers = Math.floor(memoryHeadroom / (plan.workerMemoryMb * 1024 * 1024));
-      concurrencyCap = Math.max(plan.minimumConcurrency, Math.min(
+      concurrencyCap = Math.max(1, Math.min(
         plan.configuredMax, plan.serviceCap, plan.cpuCount * 6,
         activeWorkers + Math.max(0, additionalWorkers),
       ));
-      const overLimit = memoryUsedPct >= DOMAIN_RESOURCE_LIMIT * 100
-        || cpuUsedPct >= DOMAIN_RESOURCE_LIMIT * 100;
-      if (overLimit) {
+      const update = getDomainConcurrencyUpdate({
+        targetConcurrency,
+        activeWorkers,
+        concurrencyCap,
+        cpuUsedPct,
+        memoryUsedPct,
+        resourceLimitPct: DOMAIN_RESOURCE_LIMIT * 100,
+        cooldownActive: Date.now() < cooldownUntil,
+        healthyCompletions,
+        avgHealthyBatchSec: healthyCompletions > 0 ? (healthyBatchMs / healthyCompletions) / 1000 : 0,
+      });
+      targetConcurrency = update.targetConcurrency;
+      if (update.overResourceLimit) {
         resourceConstrained = true;
-        const floor = Date.now() < cooldownUntil ? 1 : plan.minimumConcurrency;
-        targetConcurrency = Math.max(floor, Math.min(targetConcurrency, Math.floor(Math.max(1, activeWorkers) * 0.8)));
-      } else if (allowRaise && Date.now() >= cooldownUntil && memoryUsedPct < 75 && cpuUsedPct < 70) {
-        targetConcurrency = Math.min(concurrencyCap, targetConcurrency + 2);
       }
+      if (update.phase === 'auto-tuning') {
+        healthyCompletions = 0;
+        healthyBatchMs = 0;
+      }
+      return update.phase;
+    };
+
+    const recordFailure = (reason: DomainFailureReason, message: string): void => {
+      failureCounts[reason]++;
+      lastError = message;
+      healthyCompletions = 0;
+      healthyBatchMs = 0;
+    };
+
+    const applyServiceBackpressure = (reason: DomainFailureReason): boolean => {
+      if (!['timeout', 'throttle', 'invalid-response', 'engine'].includes(reason)) return false;
+      const now = Date.now();
+      cooldownUntil = Math.max(cooldownUntil, now + DOMAIN_CONGESTION_COOLDOWN_MS);
+      if (now - lastCongestionDecreaseAt >= DOMAIN_CONGESTION_DECREASE_INTERVAL_MS) {
+        targetConcurrency = reduceDomainConcurrencyForFailure(targetConcurrency, reason);
+        lastCongestionDecreaseAt = now;
+      }
+      return true;
     };
 
     const zeroProgress: CompletionProgress = {
@@ -737,7 +886,7 @@ export async function classifyDomainsWithLlm(options: {
       });
       try {
         const raw = await invokeEngineAsync(domainEngine, buildDomainPrompt(batch), {
-          timeout: 180_000,
+          timeout: domainTimeoutMs,
           env: runtime?.env,
           signal: runtime?.signal,
           killProcessGroup: Boolean(runtime),
@@ -754,27 +903,39 @@ export async function classifyDomainsWithLlm(options: {
         classified += results.length;
         llmProcessed += results.length;
         if (missing.length > 0 && attempt < DOMAIN_MAX_ATTEMPTS) {
+          const message = `retrying ${missing.length} omitted result(s)`;
+          recordFailure('invalid-response', message);
+          applyServiceBackpressure('invalid-response');
           jobs.push({ batch: missing, attempt: attempt + 1 });
-          errMsg = `retrying ${missing.length} omitted result(s)`;
+          errMsg = message;
         } else if (missing.length > 0) {
+          const message = `${missing.length} result(s) still omitted after ${attempt} attempts`;
+          recordFailure('invalid-response', message);
           batchFailed = missing.length;
           failed += missing.length;
           llmProcessed += missing.length;
+          errMsg = message;
+        } else {
+          healthyCompletions++;
+          healthyBatchMs += Date.now() - batchStarted;
         }
         ok = true;
         successBatches++;
         totalBatchMs += Date.now() - batchStarted;
       } catch (error) {
         errMsg = (error as Error).message;
-        if (attempt < DOMAIN_MAX_ATTEMPTS) {
-          const throttled = /(?:429|rate.?limit|too many requests|capacity)/i.test(errMsg);
-          if (throttled) {
-            throttleEvents++;
-            cooldownUntil = Date.now() + 15_000;
-            targetConcurrency = Math.max(1, Math.floor(targetConcurrency * 0.75));
-            await new Promise(resolve => setTimeout(resolve, 5_000 + Math.floor(Math.random() * 3_000)));
-            jobs.push({ batch, attempt: attempt + 1 });
-          } else if (batch.length > 1) {
+        const reason = classifyDomainFailure(error);
+        recordFailure(reason, errMsg);
+        if (reason === 'throttle') throttleEvents++;
+        const serviceFailure = applyServiceBackpressure(reason);
+        const retryable = reason !== 'storage';
+        if (attempt < DOMAIN_MAX_ATTEMPTS && retryable) {
+          if (serviceFailure) {
+            const baseDelay = Math.min(30_000, 3_000 * (2 ** (attempt - 1)));
+            await new Promise(resolve => setTimeout(resolve, baseDelay + Math.floor(Math.random() * 2_000)));
+          }
+          const shouldSplit = (reason === 'timeout' || reason === 'invalid-response') && batch.length > 25;
+          if (shouldSplit) {
             const middle = Math.ceil(batch.length / 2);
             jobs.push({ batch: batch.slice(0, middle), attempt: attempt + 1 });
             jobs.push({ batch: batch.slice(middle), attempt: attempt + 1 });
@@ -790,7 +951,7 @@ export async function classifyDomainsWithLlm(options: {
       return {
         batchIndex, batchSizeUsed: batch.length, batchClassified, batchFailed,
         batchSec: (Date.now() - batchStarted) / 1000, lastError: errMsg, ok,
-        phase: errMsg && batchFailed === 0 ? 'retrying' : (ok ? 'completed' : 'failed'),
+        phase: batchFailed > 0 ? 'failed' : (errMsg ? 'retrying' : (ok ? 'completed' : 'failed')),
         attempt,
       };
     };
@@ -818,11 +979,13 @@ export async function classifyDomainsWithLlm(options: {
             finishIfDrained();
           }).catch(error => {
             activeWorkers--;
+            const message = error instanceof Error ? error.message : String(error);
+            recordFailure(classifyDomainFailure(error), message);
             failed += job.batch.length;
             llmProcessed += job.batch.length;
             report({
               ...zeroProgress, batchIndex: batchCount, batchSizeUsed: job.batch.length,
-              batchFailed: job.batch.length, lastError: (error as Error).message,
+              batchFailed: job.batch.length, lastError: message,
               ok: false, phase: 'failed', attempt: job.attempt,
             });
             launch();
@@ -834,11 +997,11 @@ export async function classifyDomainsWithLlm(options: {
       resourceTimer = setInterval(() => {
         const previousTarget = targetConcurrency;
         const previousCap = concurrencyCap;
-        sampleResources(true);
+        const tuningPhase = sampleResources();
         if (targetConcurrency !== previousTarget || concurrencyCap !== previousCap) {
           report({
             ...zeroProgress, batchIndex: batchCount,
-            phase: resourceConstrained ? 'resource guard' : 'auto-tuning',
+            phase: tuningPhase || 'auto-tuning',
           });
         }
         launch();
@@ -853,9 +1016,10 @@ export async function classifyDomainsWithLlm(options: {
       batches: batchCount, prefilled: prefilled.length, concurrency: peakConcurrency,
       initialConcurrency: plan.initial, launchConcurrency: plan.launchInitial,
       finalConcurrency: targetConcurrency, peakConcurrency, concurrencyCap,
-      throttleEvents, maxCpuUsedPct, maxMemoryUsedPct,
+      throttleEvents, failureCounts: { ...failureCounts }, lastError,
+      maxCpuUsedPct, maxMemoryUsedPct,
       resourceLimitPct: DOMAIN_RESOURCE_LIMIT * 100, resourceConstrained,
-      batchSizeStart: DOMAIN_BATCH_SIZE, batchSizeEnd: DOMAIN_BATCH_SIZE,
+      batchSizeStart: domainBatchSize, batchSizeEnd: domainBatchSize,
       avgSecPerBatch: successBatches ? (totalBatchMs / successBatches) / 1000 : 0,
       avgSecPerItem: llmProcessed > 0 ? elapsedSec / llmProcessed : 0,
       elapsedSec,

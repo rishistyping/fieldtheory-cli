@@ -23,7 +23,7 @@ Use the app source repo for Mac app issues, this repo for CLI issues, the plugin
 npm install -g fieldtheory
 ```
 
-Requires Node.js 20+. A Chrome-family browser or Firefox is recommended for session sync; OAuth is available for all platforms.
+Requires Node.js 20+. Firefox is the default for session sync; supported Chrome-family browsers can be selected explicitly. OAuth is available for all platforms.
 
 ## Quick start
 
@@ -84,6 +84,60 @@ On first run, `ft sync` extracts your X session from your browser and downloads 
 | `ft classify-domains` | Classify by subject domain only (LLM) |
 | `ft classify --engine <name>` | Override the LLM engine for one run (also works on `ft sync --classify` and `ft classify-domains`) |
 | `ft model` | View or change the default LLM engine |
+
+#### Faster domain classification
+
+`ft classify-domains` runs independent LLM batches concurrently and adjusts the worker count while it runs. The default plan prefers 20 workers, uses batches of 100 bookmarks, and may grow to 60 workers after sustained healthy completions. Available memory, CPU count, current CPU/RAM use, and the service cap can lower either the launch count or the live target. CPU or RAM at 80% activates the resource guard; healthy growth only occurs below 70% CPU and 75% RAM. These are safety limits, so a constrained machine may start below 20 workers.
+
+The controller keeps successful classifications, retries only missing or failed work up to three attempts, and applies exponential backoff when the engine is throttled or unavailable. Timeouts and invalid responses reduce concurrency and split failed batches larger than 25 in half; storage errors fail immediately instead of being retried. Successful partial results are committed before omitted items are retried, so a weak response does not discard valid classifications.
+
+Codex domain runs are deliberately pinned to `gpt-5.6-sol` with `ultra` reasoning and the fast service tier. They use an ephemeral, read-only Codex process with unrelated tools and integrations disabled. Other configured engines keep their normal engine resolution. All engines receive the compact subject-classification prompt; Codex additionally enforces the packaged JSON output schema.
+
+On an interactive terminal, the native progress display shows throughput and ETA, active/target/capped workers, queued batches, CPU and RAM, peak concurrency, retry state, categorized failures, and the most recent error. Redirected output uses throttled, ANSI-free progress lines instead. Each completed run also appends a local JSONL record to `~/.fieldtheory/bookmarks/domain-classify-runs.jsonl` so performance and failures can be compared between runs. Newly created log files use mode `0600` where supported.
+
+Advanced tuning is available through environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FT_DOMAIN_INITIAL_CONCURRENCY` | `20` | Preferred starting worker count; resource limits may launch fewer |
+| `FT_DOMAIN_MAX_CONCURRENCY` | `60` | Local hard cap for workers |
+| `FT_DOMAIN_SERVICE_MAX_CONCURRENCY` | `60` | Cap used to respect an engine or account limit |
+| `FT_DOMAIN_BATCH_SIZE` | `100` | Bookmarks per initial batch (`25`–`200`) |
+| `FT_DOMAIN_TIMEOUT_MS` | `180000` | Timeout for one engine invocation |
+| `FT_DOMAIN_WORKER_MEMORY_MB` | `128` | Estimated memory per worker for launch planning |
+| `FT_DOMAIN_TUNE_INTERVAL_MS` | `1000` | Resource sampling and auto-tuning interval |
+| `FT_DOMAIN_RUN_LOG` | automatic | Custom JSONL path, or `off` to disable run logging |
+
+For example, to cap a run at 30 workers without changing its preferred start:
+
+```bash
+FT_DOMAIN_MAX_CONCURRENCY=30 ft classify-domains --engine codex
+```
+
+#### Fork enhancement reference
+
+This implementation was developed from the `afar1/fieldtheory-cli` baseline at commit `4b4a0f6` (`fix: simplify current document editing (#178)`). The baseline ran domain classification sequentially in batches of 50. The following change map is kept here so future maintenance, debugging, and upstream comparison have durable context:
+
+| Area | Enhancement over the baseline | Why it matters |
+|------|-------------------------------|----------------|
+| Scheduling | Replaced the sequential loop with an asynchronous worker pool, a preferred 20-worker start, and a configurable 60-worker ceiling | Removes the dominant wall-time bottleneck while retaining an explicit cap |
+| Resource planning | Computes launch and live caps from CPU count, available memory, estimated per-worker memory, and the 80% CPU/RAM guard | Avoids treating 20 workers as mandatory when the machine cannot safely support them |
+| Adaptive control | Adds slow additive growth after a healthy completion window, multiplicative decreases for congestion, and a cooldown between decreases | Prevents the controller from increasing concurrency merely because local CPU is idle while the remote service is already failing |
+| Batching | Uses 100-item initial batches, configurable from 25 to 200, then splits failed timeout or invalid-response batches larger than 25 in half | Balances request overhead against response reliability |
+| Retry correctness | Retries singleton batches, preserves partial successes, requeues work immediately after every settled worker, uses bounded exponential backoff, and stops after three attempts | Prevents dropped final items, unresolved scheduler exits, retry storms, and infinite work |
+| Failure handling | Classifies timeout, throttle, invalid-response, engine, storage, and unexpected failures; storage failures are terminal | Gives the controller an appropriate response for each failure class instead of counting every error alike |
+| Prompt efficiency | Sends compact indexed JSON records, clips very long bookmark text, marks bookmark fields as untrusted, and maps output indices back to bookmark IDs | Reduces token and serialization overhead without letting bookmark content become instructions |
+| Output quality | Requests one result per input, enforces the response container/item shape with a packaged Codex JSON schema, validates compact domain slugs, rejects duplicate/out-of-range results, and retains the primary domain first | Preserves classification structure at higher concurrency and makes omitted or malformed output retryable |
+| Category prefill | Reuses a single unambiguous known subject category as the domain, but does not prefill format-only or ambiguous multi-subject categories | Avoids unnecessary LLM calls without guessing when evidence is ambiguous |
+| Codex isolation | Uses an isolated temporary `CODEX_HOME` containing only an auth link, ignores user/project configuration, disables tools not needed for classification, and removes the runtime directory on completion or interruption | Reduces startup/context overhead and keeps parallel workers independent of local Codex customization |
+| Process lifecycle | Added async engine invocation with scoped environment, abort signals, detached process-group termination, timeout escalation, bounded output buffers, and listener cleanup | Prevents interrupted or timed-out runs from leaving Codex descendants or temporary runtimes behind |
+| Terminal UX | Added a native five-line TTY display plus throttled ANSI-free redirected output | Makes rate, ETA, queue depth, worker target/cap, resource use, retries, failures, and the last error visible during long runs |
+| Run history | Appends JSONL summaries with throughput, concurrency, resource peaks, failure counts, and the last error; newly created logs use mode `0600` where supported | Supports evidence-based tuning across runs without adding telemetry |
+| Build packaging | Copies `domain-classification.schema.json` into `dist` during `npm run build` | Keeps installed CLI builds equivalent to source execution |
+| Browser behavior | Replaced browser auto-detection as the implicit fallback with deterministic Firefox; `--browser` and `FT_BROWSER` still take precedence | Makes sync behavior reproducible across machines and fixes tests inheriting an unrelated Chromium installation |
+| Regression coverage | Added tests for planning under memory pressure, controller growth/decrease rules, parsing and prefill, failure classification, TTY/non-TTY rendering, and async engine cleanup; the build verifies schema packaging | Captures the performance and lifecycle invariants that are easiest to regress |
+
+The optimization does not change the bookmark database schema or the `ft classify-domains` command contract. Completed domains remain in the existing `domains` and `primary_domain` columns, so `ft domains`, `ft list --domain`, `ft viz`, exports, and the Mac app continue to consume the same data.
 
 ### Knowledge base
 
@@ -288,7 +342,7 @@ Treat `ct0` and `auth_token` like passwords. Do not paste them into logs, issues
 | OAuth API sync (`ft sync --api`) | Yes | Yes | Yes |
 | Search, list, classify, viz, wiki | Yes | Yes | Yes |
 
-Session sync extracts cookies from your browser's local database. Use `ft sync --browser <name>` to pick a browser. On Windows, Firefox requires Node.js 22.5+ or `sqlite3` on PATH. For unsupported browsers or platforms, use `ft auth` + `ft sync --api`.
+Session sync extracts cookies from your browser's local database. Firefox is the default; use `ft sync --browser <name>` to pick another browser. On Windows, Firefox requires Node.js 22.5+ or `sqlite3` on PATH. For unsupported browsers or platforms, use `ft auth` + `ft sync --api`.
 
 ## Security
 

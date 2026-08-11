@@ -249,9 +249,11 @@ export function createDomainProgressRenderer(stream: DomainOutputStream = proces
     done: 0, total: 0, classified: 0, failed: 0, prefilled: 0,
     engine: 'codex', concurrency: 1, concurrencyCap: 1, peakConcurrency: 0,
     activeWorkers: 0, queuedBatches: 0, elapsedSec: 0, etaSec: 0,
-    itemsPerMin: 0, successBatches: 0, nextBatchSize: 200,
+    itemsPerMin: 0, successBatches: 0, nextBatchSize: 100,
     cpuUsedPct: 0, memoryUsedPct: 0, maxCpuUsedPct: 0, maxMemoryUsedPct: 0,
-    throttleEvents: 0, resourceLimitPct: 80, batchIndex: 0,
+    throttleEvents: 0,
+    failureCounts: { timeout: 0, throttle: 0, 'invalid-response': 0, engine: 0, storage: 0, unexpected: 0 },
+    resourceLimitPct: 80, batchIndex: 0,
     batchSizeUsed: 0, batchClassified: 0, batchFailed: 0, batchSec: 0,
     lastError: '', ok: true, phase: 'starting', attempt: 0,
   };
@@ -279,12 +281,14 @@ export function createDomainProgressRenderer(stream: DomainOutputStream = proces
       ? Math.max(state.batchSec, (Date.now() - lastUpdateAt) / 1000)
       : state.batchSec;
     const status = state.lastError
-      ? `${state.phase}: ${state.lastError.replace(/\s+/g, ' ').trim()}`
+      ? `${state.phase} │ last error: ${state.lastError.replace(/\s+/g, ' ').trim()}`
       : state.phase;
+    const otherFailures = Object.values(state.failureCounts).reduce((sum, value) => sum + value, 0)
+      - state.failureCounts.timeout - state.failureCounts.throttle;
     return [
       clipDomainLine(`  ${spin} Field Theory · Domain classification │ ${state.engine}`, width),
       clipDomainLine(`  [${bar}] ${pct}% │ ${number(done)}/${number(state.total)} │ ${number(Math.max(0, state.total - done))} left`, width),
-      clipDomainLine(`  classified ${number(state.classified)} │ category prefill ${number(state.prefilled)} │ failed ${number(state.failed)}`, width),
+      clipDomainLine(`  classified ${number(state.classified)} │ category prefill ${number(state.prefilled)} │ failed ${number(state.failed)} │ timeouts ${number(state.failureCounts.timeout)} throttle ${number(state.failureCounts.throttle)} other ${number(otherFailures)}`, width),
       clipDomainLine(`  ${state.itemsPerMin.toFixed(1)}/min │ elapsed ${formatDomainDuration(elapsed)} │ ETA ${formatDomainDuration(eta)} │ workers ${state.activeWorkers}/${state.concurrency}≤${state.concurrencyCap} peak ${state.peakConcurrency} │ queued ${state.queuedBatches}`, width),
       clipDomainLine(`  CPU ${state.cpuUsedPct.toFixed(0)}% │ RAM ${state.memoryUsedPct.toFixed(0)}%/${state.resourceLimitPct.toFixed(0)}% │ batch #${state.batchIndex || '—'} ${number(state.batchSizeUsed)} items +${number(state.batchClassified)}/-${number(state.batchFailed)} ${batchTime.toFixed(1)}s │ ${status}`, width),
     ];
@@ -304,14 +308,14 @@ export function createDomainProgressRenderer(stream: DomainOutputStream = proces
     if (!force && !urgent && lastLogAt > 0 && now - lastLogAt < 10_000) return;
     lastLogAt = now;
     const { elapsed, eta } = currentTimes();
-    stream.write(`Domains ${number(state.done)}/${number(state.total)} (${state.total > 0 ? ((state.done / state.total) * 100).toFixed(1) : '0.0'}%) │ ${state.itemsPerMin.toFixed(1)}/min │ elapsed ${formatDomainDuration(elapsed)} │ ETA ${formatDomainDuration(eta)} │ workers ${number(state.activeWorkers)}/${number(state.concurrency)}≤${number(state.concurrencyCap)} │ CPU ${state.cpuUsedPct.toFixed(0)}% RAM ${state.memoryUsedPct.toFixed(0)}% │ queued ${number(state.queuedBatches)} │ ${state.phase}\n`);
+    stream.write(`Domains ${number(state.done)}/${number(state.total)} (${state.total > 0 ? ((state.done / state.total) * 100).toFixed(1) : '0.0'}%) │ ${state.itemsPerMin.toFixed(1)}/min │ elapsed ${formatDomainDuration(elapsed)} │ ETA ${formatDomainDuration(eta)} │ workers ${number(state.activeWorkers)}/${number(state.concurrency)}≤${number(state.concurrencyCap)} │ CPU ${state.cpuUsedPct.toFixed(0)}% RAM ${state.memoryUsedPct.toFixed(0)}% │ queued ${number(state.queuedBatches)} │ timeout ${number(state.failureCounts.timeout)} throttle ${number(state.failureCounts.throttle)} │ ${state.phase}${state.lastError ? ` │ last error: ${state.lastError.replace(/\s+/g, ' ').trim()}` : ''}\n`);
   };
   const render = (force = false) => isTty ? renderTty() : renderLog(force);
   const timer = isTty ? setInterval(() => { if (!finished) renderTty(); }, 500) : null;
   timer?.unref?.();
   const update = (progress: DomainProgress) => {
     if (finished) return;
-    state = { ...state, ...progress };
+    state = { ...state, ...progress, lastError: progress.lastError || state.lastError };
     lastUpdateAt = Date.now();
     render();
   };
@@ -337,6 +341,8 @@ export function createDomainProgressRenderer(stream: DomainOutputStream = proces
       memoryUsedPct: result.maxMemoryUsedPct,
       resourceLimitPct: result.resourceLimitPct,
       throttleEvents: result.throttleEvents,
+      failureCounts: result.failureCounts,
+      lastError: result.lastError || state.lastError,
       phase: 'done',
       ok: result.failed === 0,
     };
@@ -767,7 +773,7 @@ function showSyncWelcome(): void {
 
   Browser ids: ${browsers}
   Use --browser <name> to choose.
-  Default auto-detect prefers installed Chrome-family browsers.
+  Firefox is the default browser.
   Firefox on Windows requires Node.js 22.5+ or sqlite3 on PATH.
 `);
 }
