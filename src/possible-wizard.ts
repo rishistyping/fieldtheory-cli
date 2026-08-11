@@ -12,6 +12,7 @@
 import type { IdeasSeed } from './ideas-seeds.js';
 import type { Frame } from './adjacent/types.js';
 import { DEPTH_BUDGETS, MAX_NODE_TARGET, MIN_NODE_TARGET, validateNodeTarget } from './adjacent/prompts.js';
+import { CODEX_ENGINE_LABEL, normalizeCodexProfile } from './engine.js';
 
 /**
  * Minimal interface the wizard needs from a prompter. The prod implementation
@@ -307,22 +308,26 @@ const ENGINE_NAMES = new Set(['claude', 'codex']);
 export function parseModelProfileAnswer(answer: string): Pick<WizardPlan, 'engine' | 'model' | 'effort'> | null {
   const parts = answer.trim().split(/\s+/).filter(Boolean);
   if (parts.length === 0) return {};
+  if (parts.length === 1 && ENGINE_NAMES.has(parts[0]!.toLowerCase())) {
+    return normalizeCodexProfile({ engine: parts[0]!.toLowerCase() });
+  }
   if (parts.length === 1 && EFFORT_LEVELS.has(parts[0]!.toLowerCase())) {
     return { effort: parts[0]!.toLowerCase() };
   }
   if (parts.length === 2) {
     const second = parts[1]!.toLowerCase();
     if (EFFORT_LEVELS.has(second)) {
-      return ENGINE_NAMES.has(parts[0]!.toLowerCase())
+      const profile = ENGINE_NAMES.has(parts[0]!.toLowerCase())
         ? { engine: parts[0], effort: second }
         : { model: parts[0], effort: second };
+      return normalizeCodexProfile(profile);
     }
-    return { engine: parts[0], model: parts[1] };
+    return normalizeCodexProfile({ engine: parts[0], model: parts[1] });
   }
   if (parts.length === 3) {
     const effort = parts[2]!.toLowerCase();
     return EFFORT_LEVELS.has(effort)
-      ? { engine: parts[0], model: parts[1], effort }
+      ? normalizeCodexProfile({ engine: parts[0], model: parts[1], effort })
       : null;
   }
   return null;
@@ -336,7 +341,8 @@ export async function stepPickModelProfile(
 > {
   prompter.write('');
   prompter.write('Model profile controls which LLM runs the grid and how much reasoning effort it spends.');
-  const answer = await prompter.ask('Model profile (enter for default, or e.g. `claude opus medium`, `codex gpt-5.5 medium`, `medium`): ');
+  prompter.write(`Codex is pinned to ${CODEX_ENGINE_LABEL}; custom model and effort values apply only to Claude.`);
+  const answer = await prompter.ask('Model profile (enter for default, or e.g. `claude opus medium`, `codex`, `medium`): ');
   if (answer === 'q' || answer === 'Q') {
     return { kind: 'cancelled', reason: 'quit-at-model-profile' };
   }
@@ -371,12 +377,16 @@ export async function stepConfirm(
 }
 
 function formatModelProfile(plan: Pick<WizardPlan, 'engine' | 'model' | 'effort'>): string {
+  if (plan.engine?.toLowerCase() === 'codex') return CODEX_ENGINE_LABEL;
   const parts = [
     plan.engine ?? 'default engine',
     ...(plan.model ? [plan.model] : []),
     ...(plan.effort ? [`effort=${plan.effort}`] : []),
   ];
-  return parts.join(' / ');
+  const profile = parts.join(' / ');
+  return !plan.engine && (plan.model || plan.effort)
+    ? `${profile} (ignored if the default engine is pinned Codex)`
+    : profile;
 }
 
 // ── Orchestration ──────────────────────────────────────────────────────────

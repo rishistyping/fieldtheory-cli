@@ -14,6 +14,7 @@ import {
   stepPickNodeTarget,
   stepPickRepos,
   stepPickSeed,
+  stepConfirm,
 } from '../src/possible-wizard.js';
 
 // ── Mock prompter + fixtures ───────────────────────────────────────────────
@@ -100,8 +101,13 @@ test('parseModelProfileAnswer: supports default, effort-only, and engine/model/e
   });
   assert.deepEqual(parseModelProfileAnswer('codex gpt-5.5 medium'), {
     engine: 'codex',
-    model: 'gpt-5.5',
-    effort: 'medium',
+    model: 'gpt-5.6-sol',
+    effort: 'ultra',
+  });
+  assert.deepEqual(parseModelProfileAnswer('codex'), {
+    engine: 'codex',
+    model: 'gpt-5.6-sol',
+    effort: 'ultra',
   });
   assert.equal(parseModelProfileAnswer('claude opus enormous'), null);
 });
@@ -289,6 +295,30 @@ test('stepPickModelProfile: parses an explicit high-quality medium profile', asy
   if (result.kind === 'picked') {
     assert.deepEqual(result.profile, { engine: 'claude', model: 'opus', effort: 'medium' });
   }
+});
+
+test('stepPickModelProfile: reports and returns the pinned Codex profile', async () => {
+  const prompter = mockPrompter(['codex gpt-5.5 medium']);
+  const result = await stepPickModelProfile(prompter);
+  assert.equal(result.kind, 'picked');
+  if (result.kind === 'picked') {
+    assert.deepEqual(result.profile, {
+      engine: 'codex', model: 'gpt-5.6-sol', effort: 'ultra',
+    });
+  }
+  assert.ok(prompter.lines.some(line => line.includes('codex/gpt-5.6-sol/effort=ultra/fast')));
+});
+
+test('stepConfirm: displays the effective pinned Codex profile', async () => {
+  const prompter = mockPrompter(['']);
+  const result = await stepConfirm(prompter, {
+    seedId: 'seed-1', repos: ['/repo'], frameId: 'impact-effort', depth: 'quick',
+    engine: 'codex', model: 'gpt-5.5', effort: 'medium',
+  }, 'Seed', 'Impact × Effort');
+  assert.equal(result, 'go');
+  const modelLine = prompter.lines.find(line => line.startsWith('  model:')) ?? '';
+  assert.match(modelLine, /codex\/gpt-5\.6-sol\/effort=ultra\/fast/);
+  assert.doesNotMatch(modelLine, /gpt-5\.5|medium/);
 });
 
 // ── runPossibleWizard orchestration ────────────────────────────────────────

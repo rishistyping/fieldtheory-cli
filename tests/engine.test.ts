@@ -138,7 +138,7 @@ test('resolveEngine: uses saved preference when available', async () => {
   }
 });
 
-test('resolveEngine: carries explicit model and effort into engine args', async () => {
+test('resolveEngine: uses explicit Claude profiles and the pinned global Codex profile', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ft-engine-profile-'));
   const origEnv = process.env.FT_DATA_DIR;
   process.env.FT_DATA_DIR = tmpDir;
@@ -153,9 +153,16 @@ test('resolveEngine: carries explicit model and effort into engine args', async 
     const resolved = await resolveEngine({ engine: engineName, model, effort: 'medium' });
 
     assert.equal(resolved.name, engineName);
-    assert.equal(resolved.model, model);
-    assert.equal(resolved.effort, 'medium');
-    assert.equal(resolved.label, `${engineName}/${model}/effort=medium`);
+    const expectedModel = engineName === 'codex' ? 'gpt-5.6-sol' : model;
+    const expectedEffort = engineName === 'codex' ? 'ultra' : 'medium';
+    assert.equal(resolved.model, expectedModel);
+    assert.equal(resolved.effort, expectedEffort);
+    assert.equal(
+      resolved.label,
+      engineName === 'codex'
+        ? 'codex/gpt-5.6-sol/effort=ultra/fast'
+        : `${engineName}/${model}/effort=medium`,
+    );
 
     const args = resolved.config.args('PROMPT', resolved);
     if (engineName === 'claude') {
@@ -164,9 +171,10 @@ test('resolveEngine: carries explicit model and effort into engine args', async 
       assert.ok(args.includes('--effort'));
     } else {
       assert.ok(args.includes('--model'));
-      assert.ok(args.includes('gpt-5.5'));
+      assert.ok(args.includes('gpt-5.6-sol'));
       assert.ok(args.includes('--config'));
-      assert.ok(args.includes('model_reasoning_effort="medium"'));
+      assert.ok(args.includes('model_reasoning_effort="ultra"'));
+      assert.ok(args.includes('service_tier="fast"'));
     }
   } finally {
     process.env.FT_DATA_DIR = origEnv;
@@ -261,7 +269,7 @@ test('resolveEngine: override returns named engine when binary is on PATH', asyn
   }
 });
 
-test('resolveEngine: codex args include skip-git-repo-check', async () => {
+test('resolveEngine: codex uses the global optimized invocation profile', async () => {
   if (process.platform === 'win32') return;
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ft-engine-codex-args-'));
@@ -273,11 +281,25 @@ test('resolveEngine: codex args include skip-git-repo-check', async () => {
     fs.writeFileSync(fakeBin, '#!/bin/sh\nexit 0\n');
     fs.chmodSync(fakeBin, 0o755);
 
-    const { resolveEngine } = await import('../src/engine.js');
+    const { buildCodexArgs, resolveEngine } = await import('../src/engine.js');
     const resolved = await resolveEngine({ override: 'codex' });
+    assert.equal(resolved.model, 'gpt-5.6-sol');
+    assert.equal(resolved.effort, 'ultra');
+    assert.equal(resolved.label, 'codex/gpt-5.6-sol/effort=ultra/fast');
+    const args = resolved.config.args('hello', resolved);
+    assert.deepEqual(args.slice(0, 5), [
+      'exec', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules',
+    ]);
+    assert.ok(args.includes('gpt-5.6-sol'));
+    assert.ok(args.includes('model_reasoning_effort="ultra"'));
+    assert.ok(args.includes('service_tier="fast"'));
+    assert.ok(args.includes('fast_mode'));
+    assert.ok(args.includes('mcp_servers={}'));
+    assert.ok(args.includes('read-only'));
+    assert.equal(args.at(-1), 'hello');
     assert.deepEqual(
-      resolved.config.args('hello'),
-      ['exec', '--skip-git-repo-check', 'hello'],
+      buildCodexArgs('PROMPT', ['--output-schema', '/tmp/schema.json']).slice(-3),
+      ['--output-schema', '/tmp/schema.json', 'PROMPT'],
     );
   } finally {
     process.env.PATH = origPath;

@@ -18,6 +18,39 @@ export interface EngineConfig {
   args: (prompt: string, engine?: Pick<ResolvedEngine, 'model' | 'effort'>) => string[];
 }
 
+export const CODEX_MODEL = 'gpt-5.6-sol';
+export const CODEX_EFFORT = 'ultra';
+export const CODEX_SERVICE_TIER = 'fast';
+export const CODEX_ENGINE_LABEL = `codex/${CODEX_MODEL}/effort=${CODEX_EFFORT}/${CODEX_SERVICE_TIER}`;
+
+export function normalizeCodexProfile<T extends { engine?: string; model?: string; effort?: string }>(profile: T): T {
+  if (profile.engine?.trim().toLowerCase() !== 'codex') return profile;
+  return {
+    ...profile,
+    engine: 'codex',
+    model: CODEX_MODEL,
+    effort: CODEX_EFFORT,
+  };
+}
+
+/** Shared minimal Codex profile used by every Field Theory LLM invocation. */
+export function buildCodexArgs(prompt: string, extraArgs: string[] = []): string[] {
+  return [
+    'exec', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules',
+    '--model', CODEX_MODEL,
+    '--config', `model_reasoning_effort="${CODEX_EFFORT}"`,
+    '--config', `service_tier="${CODEX_SERVICE_TIER}"`,
+    '--enable', 'fast_mode', '--config', 'mcp_servers={}',
+    '--config', 'project_doc_max_bytes=0', '--config', 'web_search="disabled"',
+    '--disable', 'apps', '--disable', 'goals', '--disable', 'hooks',
+    '--disable', 'multi_agent', '--disable', 'shell_tool', '--disable', 'plugins',
+    '--disable', 'plugin_sharing', '--disable', 'skill_mcp_dependency_install',
+    '--sandbox', 'read-only', '--color', 'never',
+    ...extraArgs,
+    prompt,
+  ];
+}
+
 const KNOWN_ENGINES: Record<string, EngineConfig> = {
   claude: {
     bin: 'claude',
@@ -32,13 +65,7 @@ const KNOWN_ENGINES: Record<string, EngineConfig> = {
   },
   codex: {
     bin: 'codex',
-    args: (p, engine) => [
-      'exec',
-      '--skip-git-repo-check',
-      ...(engine?.model ? ['--model', engine.model] : []),
-      ...(engine?.effort ? ['--config', `model_reasoning_effort="${engine.effort}"`] : []),
-      p,
-    ],
+    args: p => buildCodexArgs(p),
   },
 };
 
@@ -137,18 +164,18 @@ function formatEngineLabel(input: { name: string; model?: string; effort?: strin
 }
 
 export function describeEngine(engine: Pick<ResolvedEngine, 'name' | 'model' | 'effort'>): string {
-  return formatEngineLabel(engine);
+  return engine.name === 'codex' ? CODEX_ENGINE_LABEL : formatEngineLabel(engine);
 }
 
 function resolve(name: string, profile: EngineRunProfile = {}): ResolvedEngine {
-  const model = cleanOptional(profile.model);
-  const effort = cleanOptional(profile.effort);
+  const model = name === 'codex' ? CODEX_MODEL : cleanOptional(profile.model);
+  const effort = name === 'codex' ? CODEX_EFFORT : cleanOptional(profile.effort);
   return {
     name,
     config: KNOWN_ENGINES[name],
     model,
     effort,
-    label: formatEngineLabel({ name, model, effort }),
+    label: describeEngine({ name, model, effort }),
   };
 }
 
