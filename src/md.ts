@@ -29,6 +29,16 @@ import {
   type MdBookmark,
 } from './md-prompts.js';
 import { stripLlmMarkdownFence } from './md-fence.js';
+import {
+  classifyWikiFailure,
+  getWikiConcurrencyCap,
+  getWikiConcurrencyPlan,
+  getWikiConcurrencyUpdate,
+  reduceWikiConcurrency,
+  sampleWikiResources,
+  wikiCpuSnapshot,
+  wikiNumericEnv,
+} from './wiki-concurrency.js';
 
 const MIN_CATEGORY_COUNT = 5;
 const MIN_DOMAIN_COUNT   = 5;
@@ -58,6 +68,40 @@ export interface CompileOptions {
   only?: string[];
   engineOverride?: string;
   onProgress?: (status: string) => void;
+  onStatus?: (status: WikiProgress) => void;
+  signal?: AbortSignal;
+}
+
+export interface WikiFailureCounts {
+  timeout: number;
+  throttle: number;
+  auth: number;
+  engine: number;
+  storage: number;
+  unexpected: number;
+}
+
+export interface WikiProgress {
+  engine: string;
+  done: number;
+  total: number;
+  created: number;
+  updated: number;
+  failed: number;
+  retries: number;
+  activeWorkers: number;
+  targetConcurrency: number;
+  concurrencyCap: number;
+  peakConcurrency: number;
+  elapsedSec: number;
+  etaSec: number;
+  pagesPerMin: number;
+  cpuUsedPct: number;
+  memoryUsedPct: number;
+  resourceLimitPct: number;
+  phase: string;
+  currentPage: string;
+  failureCounts: WikiFailureCounts;
 }
 
 export interface CompileResult {
@@ -69,6 +113,16 @@ export interface CompileResult {
   totalPages: number;
   elapsed: number;
   aborted: boolean;
+  interrupted: boolean;
+  retries: number;
+  initialConcurrency: number;
+  finalConcurrency: number;
+  peakConcurrency: number;
+  concurrencyCap: number;
+  maxCpuUsedPct: number;
+  maxMemoryUsedPct: number;
+  resourceLimitPct: number;
+  failureCounts: WikiFailureCounts;
 }
 
 function sha256(text: string): string {
@@ -330,6 +384,26 @@ async function doCompile(
   let pagesSkipped = 0;
   let pagesFailed  = 0;
   let aborted      = false;
+  let interrupted  = false;
+  let retries = 0;
+  const plan = getWikiConcurrencyPlan();
+  let targetConcurrency = plan.initial;
+  let concurrencyCap = plan.cap;
+  let peakConcurrency = 0;
+  let cpuUsedPct = 0;
+  let memoryUsedPct = plan.memoryUsedPct;
+  let maxCpuUsedPct = 0;
+  let maxMemoryUsedPct = memoryUsedPct;
+  const failureCounts: WikiFailureCounts = {
+    timeout: 0, throttle: 0, auth: 0, engine: 0, storage: 0, unexpected: 0,
+  };
+  const controller = new AbortController();
+  const onExternalAbort = () => {
+    interrupted = true;
+    controller.abort();
+  };
+  options.signal?.addEventListener('abort', onExternalAbort, { once: true });
+  if (options.signal?.aborted) onExternalAbort();
 
   const db = await openBookmarksDb();
 
@@ -378,96 +452,236 @@ async function doCompile(
     // Per-event line: echo to the terminal and append to log.md so the
     // user can `tail -f` the log from another shell while a compile runs.
     const logLine = async (msg: string): Promise<void> => {
-      progress(msg);
+      try { progress(msg); } catch { /* observational */ }
       try { await appendLine(mdLogPath(), logEntry('compile', msg)); } catch { /* best effort */ }
     };
 
     if (toGenerate.length === 0) {
       progress('Nothing to compile — all pages up to date.');
     } else {
-      const est = toGenerate.length > 3 ? ` (~${toGenerate.length}–${toGenerate.length * 2} min)` : '';
-      progress(`\nGenerating ${toGenerate.length} pages with ${engine.name}${est}`);
+      progress(`\nGenerating ${toGenerate.length} pages with ${engine.label}`);
       if (skipCount > 0) progress(`  ${skipCount} pages unchanged, skipping`);
+      progress(`  Dynamic workers: ${plan.initial} initial, ≤${plan.cap} current resource cap, ${plan.resourceLimitPct}% CPU/RAM guard`);
       progress(`  Follow live: tail -f ${mdLogPath()}`);
       progress('');
       await appendLine(
         mdLogPath(),
-        logEntry('compile', `start — ${toGenerate.length} pages, engine=${engine.name}`),
+        logEntry('compile', `start — ${toGenerate.length} pages, engine=${engine.label}, workers=${plan.initial}≤${plan.cap}`),
       );
     }
 
-    // ── Generate each page ───────────────────────────────────────────────
+    // ── Generate independent pages concurrently ─────────────────────────
+    interface WikiJob { item: WorkItem; ordinal: number; attempt: number }
+    const jobs: WikiJob[] = toGenerate.map((item, index) => ({ item, ordinal: index + 1, attempt: 1 }));
+    let nextJob = 0;
+    let activeWorkers = 0;
+    let completedPages = 0;
     let consecutiveFailures = 0;
     let firstFailureMsg = '';
-    for (let i = 0; i < toGenerate.length; i++) {
-      const item = toGenerate[i];
-      const tag = `[${i + 1}/${toGenerate.length}]`;
+    let lastEngineError: EngineInvocationError | null = null;
+    let healthyCompletions = 0;
+    let healthyPageMs = 0;
+    let cooldownUntil = 0;
+    let lastCongestionDecreaseAt = 0;
+    let previousCpu = wikiCpuSnapshot();
+    let stateWrite = Promise.resolve();
 
-      let samples: CategorySample[];
-      let prompt: string;
-      if (item.type === 'category') {
-        samples = await sampleByCategory(item.name, MAX_SAMPLE_SIZE, db);
-        prompt  = buildCategoryPagePrompt(item.name, mapToMdBookmarks(samples));
-      } else if (item.type === 'domain') {
-        samples = await sampleByDomain(item.name, MAX_SAMPLE_SIZE, db);
-        prompt  = buildDomainPagePrompt(item.name, mapToMdBookmarks(samples));
-      } else {
-        samples = await sampleByAuthor(item.name, MAX_SAMPLE_SIZE, db);
-        prompt  = buildEntityPagePrompt(item.name, mapToMdBookmarks(samples));
+    const serializeStateWrite = <T>(fn: () => Promise<T>): Promise<T> => {
+      const run = stateWrite.then(fn, fn);
+      stateWrite = run.then(() => undefined, () => undefined);
+      return run;
+    };
+
+    const waitForRetry = (ms: number): Promise<void> => new Promise(resolve => {
+      if (controller.signal.aborted) { resolve(); return; }
+      const timer = setTimeout(done, ms);
+      const onAbort = () => done();
+      function done() {
+        clearTimeout(timer);
+        controller.signal.removeEventListener('abort', onAbort);
+        resolve();
       }
+      controller.signal.addEventListener('abort', onAbort, { once: true });
+    });
 
-      const opts = llmOpts(samples.length);
-      await logLine(`${tag} ${item.key} (${samples.length} sampled, ${Math.round(opts.timeout / 1000)}s timeout)...`);
-
-      let content: string;
+    const report = (phase: string, currentPage = '') => {
+      const elapsedSec = Math.max(0.001, (Date.now() - startTime) / 1000);
+      const pagesPerMin = completedPages > 0 ? (completedPages / elapsedSec) * 60 : 0;
+      const etaSec = pagesPerMin > 0
+        ? Math.max(0, (toGenerate.length - completedPages) / (pagesPerMin / 60))
+        : 0;
       try {
-        const raw = await invokeEngineAsync(engine, prompt, opts);
-        content = stripLlmMarkdownFence(raw);
+        options.onStatus?.({
+          engine: engine.label, done: completedPages, total: toGenerate.length,
+          created: pagesCreated, updated: pagesUpdated, failed: pagesFailed, retries,
+          activeWorkers, targetConcurrency, concurrencyCap, peakConcurrency,
+          elapsedSec, etaSec, pagesPerMin, cpuUsedPct, memoryUsedPct,
+          resourceLimitPct: plan.resourceLimitPct, phase, currentPage,
+          failureCounts: { ...failureCounts },
+        });
+      } catch { /* observational */ }
+    };
+
+    const sampleAndPrompt = async (item: WorkItem): Promise<{ samples: CategorySample[]; prompt: string }> => {
+      if (item.type === 'category') {
+        const samples = await sampleByCategory(item.name, MAX_SAMPLE_SIZE, db);
+        return { samples, prompt: buildCategoryPagePrompt(item.name, mapToMdBookmarks(samples)) };
+      }
+      if (item.type === 'domain') {
+        const samples = await sampleByDomain(item.name, MAX_SAMPLE_SIZE, db);
+        return { samples, prompt: buildDomainPagePrompt(item.name, mapToMdBookmarks(samples)) };
+      }
+      const samples = await sampleByAuthor(item.name, MAX_SAMPLE_SIZE, db);
+      return { samples, prompt: buildEntityPagePrompt(item.name, mapToMdBookmarks(samples)) };
+    };
+
+    const runJob = async (job: WikiJob): Promise<void> => {
+      if (controller.signal.aborted) return;
+      const { item, ordinal, attempt } = job;
+      const tag = `[${ordinal}/${toGenerate.length}]`;
+      const pageStarted = Date.now();
+      try {
+        const { samples, prompt } = await sampleAndPrompt(item);
+        const opts = llmOpts(samples.length);
+        await logLine(`${tag} ${item.key} (${samples.length} sampled, ${Math.round(opts.timeout / 1000)}s timeout, attempt ${attempt}/3)...`);
+        report('running', item.key);
+        const raw = await invokeEngineAsync(engine, prompt, {
+          ...opts,
+          signal: controller.signal,
+          killProcessGroup: true,
+        });
+        const content = stripLlmMarkdownFence(raw);
+        if (!content.trim()) throw new Error('Engine returned an empty wiki page');
+
+        const outcome = await serializeStateWrite(async () => {
+          const dirFn = item.type === 'category' ? mdCategoriesDir
+            : item.type === 'domain' ? mdDomainsDir : mdEntitiesDir;
+          const filePath = path.join(dirFn(), `${slug(item.name)}.md`);
+          const relPath = `${item.type === 'category' ? 'categories' : item.type === 'domain' ? 'domains' : 'entities'}/${slug(item.name)}.md`;
+          const saved = await writePage(filePath, content, state, relPath);
+          state.groupCounts[item.key] = String(item.count);
+          await writeJson(mdStatePath(), state);
+          return saved;
+        });
+
+        if (outcome === 'created') pagesCreated++;
+        else if (outcome === 'updated') pagesUpdated++;
+        else pagesSkipped++;
+        completedPages++;
+        consecutiveFailures = 0;
+        healthyCompletions++;
+        healthyPageMs += Date.now() - pageStarted;
+        await logLine(`${tag} ${item.key} → ${outcome}`);
+        report('completed', item.key);
       } catch (err) {
-        // Prefer the structured EngineInvocationError fields over err.message.
-        // err.message used to be the execFile-formatted "Command failed: claude
-        // -p --output-format text <FULL PROMPT>", which consumed the entire
-        // log budget with prompt bytes and hid the real signal. We now log a
-        // short label derived from the failure reason plus the tail of stderr,
-        // which is usually where claude/codex put "auth expired" / "rate limit"
-        // / "model not available".
+        const reason = classifyWikiFailure(err, controller.signal.aborted);
+        if (reason === 'interrupted') return;
+        if (err instanceof EngineInvocationError) lastEngineError = err;
+        failureCounts[reason]++;
         const eie = err instanceof EngineInvocationError ? err : null;
-        const label = eie ? reasonLabel(eie.reason) : 'ERROR';
+        const label = eie ? reasonLabel(eie.reason) : reason.toUpperCase();
         const detail = eie ? formatFailureDetail(eie) : (err as Error).message ?? String(err);
-        await logLine(`${tag} ${item.key} — ${label}: ${detail.slice(0, 200)}`);
+        const serviceFailure = reason === 'timeout' || reason === 'throttle' || reason === 'engine';
+        if (serviceFailure) {
+          const now = Date.now();
+          if (now - lastCongestionDecreaseAt >= 5_000) {
+            targetConcurrency = reduceWikiConcurrency(targetConcurrency, reason);
+            lastCongestionDecreaseAt = now;
+          }
+          cooldownUntil = now + 30_000;
+          healthyCompletions = 0;
+          healthyPageMs = 0;
+        }
+        const retryable = reason !== 'auth' && reason !== 'storage';
+        if (retryable && attempt < 3) {
+          retries++;
+          await logLine(`${tag} ${item.key} — ${label}: ${detail.slice(0, 200)}; retry ${attempt + 1}/3`);
+          report('retrying', item.key);
+          if (serviceFailure) {
+            const backoffMs = Math.min(15_000, 1_500 * (2 ** (attempt - 1))) + Math.floor(Math.random() * 1_000);
+            await waitForRetry(backoffMs);
+          }
+          if (!controller.signal.aborted) jobs.push({ ...job, attempt: attempt + 1 });
+          return;
+        }
+
         pagesFailed++;
+        completedPages++;
         consecutiveFailures++;
-        if (!firstFailureMsg) firstFailureMsg = eie?.message ?? (err as Error).message ?? String(err);
+        if (!firstFailureMsg) firstFailureMsg = detail;
+        await logLine(`${tag} ${item.key} — ${label}: ${detail.slice(0, 200)}`);
+        report('failed', item.key);
         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
           aborted = true;
-          await logLine(
-            `Aborted after ${MAX_CONSECUTIVE_FAILURES} consecutive failures — first error: ${firstFailureMsg.slice(0, 300)}`,
-          );
-          await logLine(engineFailureHint(engine.name, eie));
-          break;
+          await logLine(`Aborted after ${MAX_CONSECUTIVE_FAILURES} consecutive terminal failures — first error: ${firstFailureMsg.slice(0, 300)}`);
+          await logLine(engineFailureHint(engine.name, lastEngineError));
+          controller.abort();
         }
-        continue;
       }
+    };
 
-      const dirFn = item.type === 'category' ? mdCategoriesDir
-        : item.type === 'domain' ? mdDomainsDir : mdEntitiesDir;
-      const filePath = path.join(dirFn(), `${slug(item.name)}.md`);
-      const relPath  = `${item.type === 'category' ? 'categories' : item.type === 'domain' ? 'domains' : 'entities'}/${slug(item.name)}.md`;
-      const outcome  = await writePage(filePath, content, state, relPath);
-      state.groupCounts[item.key] = String(item.count);
-
-      if (outcome === 'created') pagesCreated++;
-      else if (outcome === 'updated') pagesUpdated++;
-      else pagesSkipped++;
-
-      // Save state after each page so Ctrl-C resumes where we left off
-      await writeJson(mdStatePath(), state);
-
-      await logLine(`${tag} ${item.key} → ${outcome}`);
-      consecutiveFailures = 0;
+    report(toGenerate.length > 0 ? 'starting' : 'done');
+    if (jobs.length > 0) {
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const tuneIntervalMs = wikiNumericEnv('FT_WIKI_TUNE_INTERVAL_MS', 2_000, 250, 10_000);
+        const finishIfDrained = () => {
+          const drained = activeWorkers === 0
+            && (controller.signal.aborted || nextJob >= jobs.length);
+          if (!settled && drained) {
+            settled = true;
+            clearInterval(resourceTimer);
+            resolve();
+          }
+        };
+        const launch = () => {
+          if (settled || controller.signal.aborted) { finishIfDrained(); return; }
+          while (activeWorkers < targetConcurrency && nextJob < jobs.length) {
+            const job = jobs[nextJob++];
+            activeWorkers++;
+            peakConcurrency = Math.max(peakConcurrency, activeWorkers);
+            runJob(job).finally(() => {
+              activeWorkers--;
+              launch();
+              finishIfDrained();
+            });
+          }
+          finishIfDrained();
+        };
+        const resourceTimer = setInterval(() => {
+          const resources = sampleWikiResources(previousCpu);
+          previousCpu = resources.cpu;
+          cpuUsedPct = resources.cpuUsedPct;
+          memoryUsedPct = resources.memoryUsedPct;
+          maxCpuUsedPct = Math.max(maxCpuUsedPct, cpuUsedPct);
+          maxMemoryUsedPct = Math.max(maxMemoryUsedPct, memoryUsedPct);
+          concurrencyCap = getWikiConcurrencyCap({
+            plan, activeWorkers, freeRatio: resources.freeRatio,
+          });
+          const update = getWikiConcurrencyUpdate({
+            targetConcurrency, activeWorkers, concurrencyCap,
+            cpuUsedPct, memoryUsedPct, resourceLimitPct: plan.resourceLimitPct,
+            cooldownActive: Date.now() < cooldownUntil,
+            healthyCompletions,
+            avgHealthyPageSec: healthyCompletions > 0 ? (healthyPageMs / healthyCompletions) / 1000 : 0,
+          });
+          targetConcurrency = update.targetConcurrency;
+          if (update.phase === 'auto-tuning') {
+            healthyCompletions = 0;
+            healthyPageMs = 0;
+          }
+          report(update.phase || 'running');
+          launch();
+        }, tuneIntervalMs);
+        resourceTimer.unref?.();
+        launch();
+      });
     }
+    await stateWrite;
+    report(interrupted ? 'interrupted' : aborted ? 'aborted' : 'done');
   } finally {
     db.close();
+    options.signal?.removeEventListener('abort', onExternalAbort);
   }
 
   // ── Index ───────────────────────────────────────────────────────────────
@@ -480,7 +694,7 @@ async function doCompile(
   const totalPages = pagesCreated + pagesUpdated;
   await appendLine(
     mdLogPath(),
-    logEntry('compile', `${aborted ? 'aborted ' : ''}engine=${engine.name} created=${pagesCreated} updated=${pagesUpdated} skipped=${pagesSkipped} failed=${pagesFailed} elapsed=${elapsed}s`),
+    logEntry('compile', `${interrupted ? 'interrupted ' : aborted ? 'aborted ' : ''}engine=${engine.label} created=${pagesCreated} updated=${pagesUpdated} skipped=${pagesSkipped} failed=${pagesFailed} retries=${retries} workers=${plan.initial}->${targetConcurrency} peak=${peakConcurrency} elapsed=${elapsed}s`),
   );
 
   // ── Save state ───────────────────────────────────────────────────────────
@@ -488,5 +702,11 @@ async function doCompile(
   state.totalCompiles  = (state.totalCompiles ?? 0) + 1;
   await writeJson(mdStatePath(), state);
 
-  return { engine: engine.name, pagesCreated, pagesUpdated, pagesSkipped, pagesFailed, totalPages, elapsed, aborted };
+  return {
+    engine: engine.name, pagesCreated, pagesUpdated, pagesSkipped, pagesFailed,
+    totalPages, elapsed, aborted, interrupted, retries,
+    initialConcurrency: plan.initial, finalConcurrency: targetConcurrency,
+    peakConcurrency, concurrencyCap, maxCpuUsedPct, maxMemoryUsedPct,
+    resourceLimitPct: plan.resourceLimitPct, failureCounts,
+  };
 }
