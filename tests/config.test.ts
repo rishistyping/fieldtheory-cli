@@ -2,15 +2,22 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadChromeSessionConfig } from '../src/config.js';
 
-test('loadChromeSessionConfig reads chrome user data dir and profile directory from env', () => {
+test('loadChromeSessionConfig reads data dir and profile from env with Firefox as default', () => {
+  const previousBrowser = process.env.FT_BROWSER;
+  process.env.FT_BROWSER = '';
   process.env.FT_CHROME_USER_DATA_DIR = '/tmp/chrome-user-data';
   process.env.FT_CHROME_PROFILE_DIRECTORY = 'Profile 1';
-  const config = loadChromeSessionConfig();
-  assert.equal(config.chromeUserDataDir, '/tmp/chrome-user-data');
-  assert.equal(config.chromeProfileDirectory, 'Profile 1');
-  assert.equal(config.browser.id, 'chrome');
-  delete process.env.FT_CHROME_USER_DATA_DIR;
-  delete process.env.FT_CHROME_PROFILE_DIRECTORY;
+  try {
+    const config = loadChromeSessionConfig();
+    assert.equal(config.chromeUserDataDir, '/tmp/chrome-user-data');
+    assert.equal(config.chromeProfileDirectory, 'Profile 1');
+    assert.equal(config.browser.id, 'firefox');
+  } finally {
+    delete process.env.FT_CHROME_USER_DATA_DIR;
+    delete process.env.FT_CHROME_PROFILE_DIRECTORY;
+    if (previousBrowser === undefined) delete process.env.FT_BROWSER;
+    else process.env.FT_BROWSER = previousBrowser;
+  }
 });
 
 test('loadChromeSessionConfig defaults profile to Default', () => {

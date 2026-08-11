@@ -2,7 +2,7 @@ import { config as loadDotenv } from 'dotenv';
 import path from 'node:path';
 import os from 'node:os';
 import { dataDir } from './paths.js';
-import { getBrowser, browserUserDataDir, detectBrowser, listBrowserIds } from './browsers.js';
+import { getBrowser, browserUserDataDir, listBrowserIds } from './browsers.js';
 import type { BrowserDef } from './browsers.js';
 
 export interface ChromeSessionConfig {
@@ -28,9 +28,9 @@ export function loadEnv(): void {
 export function loadChromeSessionConfig(overrides: { browserId?: string } = {}): ChromeSessionConfig {
   loadEnv();
 
-  // Resolve browser: CLI flag > FT_BROWSER env > auto-detect
+  // Resolve browser: CLI flag > FT_BROWSER env > deterministic Firefox default.
   const browserId = overrides.browserId ?? process.env.FT_BROWSER;
-  const browser = browserId ? getBrowser(browserId) : detectBrowser();
+  const browser = getBrowser(browserId || 'firefox');
 
   // Resolve user-data dir: env override > registry path for the browser
   const dir = process.env.FT_CHROME_USER_DATA_DIR ?? browserUserDataDir(browser);
