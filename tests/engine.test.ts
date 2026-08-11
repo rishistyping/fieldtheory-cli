@@ -639,3 +639,60 @@ while [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('invokeEngineAsync: abort kills a SIGTERM-resistant detached engine group', async () => {
+  if (process.platform === 'win32') return;
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ft-engine-abort-group-'));
+  const scriptPath = path.join(tmpDir, 'resistant-engine.mjs');
+  const pidPath = path.join(tmpDir, 'engine.pid');
+  let enginePid = 0;
+  try {
+    fs.writeFileSync(scriptPath, `
+import fs from 'node:fs';
+process.on('SIGTERM', () => {});
+fs.writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));
+setInterval(() => {}, 1_000);
+`);
+    const engine = {
+      name: 'fake',
+      config: { bin: process.execPath, args: () => [scriptPath] },
+    };
+    const controller = new AbortController();
+    const { invokeEngineAsync, EngineInvocationError } = await import('../src/engine.js');
+    const invocation = invokeEngineAsync(engine, 'ignored', {
+      timeout: 10_000,
+      signal: controller.signal,
+      killProcessGroup: true,
+    });
+
+    const pidDeadline = Date.now() + 2_000;
+    while (!fs.existsSync(pidPath) && Date.now() < pidDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert.ok(fs.existsSync(pidPath), 'engine did not publish its PID');
+    enginePid = Number(fs.readFileSync(pidPath, 'utf8'));
+    assert.ok(Number.isInteger(enginePid) && enginePid > 1, `invalid engine PID: ${enginePid}`);
+
+    controller.abort();
+    await assert.rejects(invocation, (error: unknown) =>
+      error instanceof EngineInvocationError && error.killed && /interrupted/.test(error.message));
+
+    const exitDeadline = Date.now() + 2_000;
+    let alive = true;
+    while (alive && Date.now() < exitDeadline) {
+      try { process.kill(enginePid, 0); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') alive = false;
+        else throw error;
+      }
+      if (alive) await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert.equal(alive, false, `aborted engine PID ${enginePid} is still alive`);
+  } finally {
+    if (enginePid > 1) {
+      try { process.kill(-enginePid, 'SIGKILL'); } catch { /* already dead */ }
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

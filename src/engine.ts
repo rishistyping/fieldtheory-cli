@@ -235,6 +235,9 @@ export async function resolveEngine(profile: EngineRunProfile = {}): Promise<Res
 export interface InvokeOptions {
   timeout?: number;
   maxBuffer?: number;
+  env?: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
+  killProcessGroup?: boolean;
 }
 
 /**
@@ -427,10 +430,13 @@ export function invokeEngineAsync(engine: ResolvedEngine, prompt: string, opts: 
   const { bin, args } = engine.config;
   const timeout   = opts.timeout   ?? DEFAULT_TIMEOUT;
   const maxBuffer = opts.maxBuffer ?? DEFAULT_MAXBUF;
+  const useProcessGroup = Boolean(opts.killProcessGroup && process.platform !== 'win32');
 
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args(prompt, engine), {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: opts.env ? { ...process.env, ...opts.env } : undefined,
+      detached: useProcessGroup,
     });
 
     // Close stdin immediately with EOF so `claude -p` doesn't wait on it.
@@ -451,18 +457,31 @@ export function invokeEngineAsync(engine: ResolvedEngine, prompt: string, opts: 
     /** Send SIGTERM, then escalate to SIGKILL after a grace period in case
      *  the child traps SIGTERM. `.unref()` so the escalation timer does not
      *  keep the event loop alive past shutdown. */
+    const signalChild = (signal: NodeJS.Signals) => {
+      try {
+        if (useProcessGroup && child.pid) process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch { /* already dead */ }
+    };
+
     const killChild = () => {
-      try { child.kill('SIGTERM'); } catch { /* already dead */ }
+      signalChild('SIGTERM');
       const escalate = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already dead */ }
+        signalChild('SIGKILL');
       }, SIGKILL_GRACE_MS);
       escalate.unref();
+    };
+
+    let onAbort: (() => void) | undefined;
+    const removeAbortListener = () => {
+      if (onAbort) opts.signal?.removeEventListener('abort', onAbort);
     };
 
     const fail = (err: EngineInvocationError) => {
       if (settled) return;
       settled = true;
       if (timer !== undefined) clearTimeout(timer);
+      removeAbortListener();
       killChild();
       reject(err);
     };
@@ -471,8 +490,24 @@ export function invokeEngineAsync(engine: ResolvedEngine, prompt: string, opts: 
       if (settled) return;
       settled = true;
       if (timer !== undefined) clearTimeout(timer);
+      removeAbortListener();
       resolve(out);
     };
+
+    onAbort = () => {
+      if (settled) return;
+      // Interrupt cleanup must be synchronous because the parent immediately
+      // re-raises its signal. Kill the entire detached classifier group so a
+      // launcher cannot orphan its native Codex descendant.
+      signalChild('SIGKILL');
+      fail(new EngineInvocationError({
+        engine: engine.name, bin, stderr: stderrTail(),
+        killed: true, code: null, signal: 'SIGKILL', reason: 'exit',
+        message: `${engine.name} interrupted`,
+      }));
+    };
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
+    if (opts.signal?.aborted) onAbort();
 
     child.stdout?.on('data', (d: Buffer) => {
       stdoutBytes += d.length;
@@ -512,6 +547,7 @@ export function invokeEngineAsync(engine: ResolvedEngine, prompt: string, opts: 
       if (timer !== undefined) clearTimeout(timer);
       if (settled) return;
       settled = true;
+      removeAbortListener();
       reject(new EngineInvocationError({
         engine: engine.name, bin,
         stderr: '', killed: false, code: null, signal: null, reason: 'spawn',
@@ -528,6 +564,7 @@ export function invokeEngineAsync(engine: ResolvedEngine, prompt: string, opts: 
         return;
       }
       settled = true;
+      removeAbortListener();
       reject(new EngineInvocationError({
         engine: engine.name, bin, stderr,
         killed: false, code, signal, reason: 'exit',
