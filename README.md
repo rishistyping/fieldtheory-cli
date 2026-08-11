@@ -120,7 +120,17 @@ FT_DOMAIN_MAX_CONCURRENCY=30 ft classify-domains --engine codex
 
 #### Fork enhancement reference
 
-This implementation was developed from the `afar1/fieldtheory-cli` baseline at commit `4b4a0f6` (`fix: simplify current document editing (#178)`). The baseline ran domain classification sequentially in batches of 50. The following change map is kept here so future maintenance, debugging, and upstream comparison have durable context:
+This implementation was developed from the `afar1/fieldtheory-cli` baseline at commit `4b4a0f6` (`fix: simplify current document editing (#178)`). The baseline ran domain classification sequentially in batches of 50, let most Codex calls inherit local configuration, and compiled wiki pages one at a time. The fork deliberately keeps this history in the README because it is also used as maintenance and agent context.
+
+The first three optimization changes were integrated independently into `rishistyping/fieldtheory-cli`:
+
+| Change | Pull request and merge | Durable result |
+|--------|------------------------|----------------|
+| `d499af0` — Optimize concurrent domain classification | [PR #1](https://github.com/rishistyping/fieldtheory-cli/pull/1), merge `02ac60c` | Introduced concurrent domain batches, dynamic planning, the native progress UI, structured Codex output, async engine execution, and packaged schema support |
+| `52dc42d` — Harden domain classification controller and document enhancements | [PR #2](https://github.com/rishistyping/fieldtheory-cli/pull/2), merge `252025e` | Corrected retry/drain and child-process cleanup behavior, added failure-aware backpressure and run logs, made Firefox deterministic by default, and documented the fork delta |
+| `dab5001` — Standardize Codex profile across Field Theory | [PR #3](https://github.com/rishistyping/fieldtheory-cli/pull/3), merge `e0c8f4f` | Moved the optimized Codex invocation into the shared engine path and made Possible plans, help text, labels, caches, and provenance report the profile that actually runs |
+
+The following change map describes the cumulative behavior after those merges and the concurrent wiki work:
 
 | Area | Enhancement over the baseline | Why it matters |
 |------|-------------------------------|----------------|
@@ -134,6 +144,7 @@ This implementation was developed from the `afar1/fieldtheory-cli` baseline at c
 | Output quality | Requests one result per input, enforces the response container/item shape with a packaged Codex JSON schema, validates compact domain slugs, rejects duplicate/out-of-range results, and retains the primary domain first | Preserves classification structure at higher concurrency and makes omitted or malformed output retryable |
 | Category prefill | Reuses a single unambiguous known subject category as the domain, but does not prefill format-only or ambiguous multi-subject categories | Avoids unnecessary LLM calls without guessing when evidence is ambiguous |
 | Global Codex profile | All Field Theory Codex calls use `gpt-5.6-sol`, `ultra` reasoning, the fast tier, ephemeral/read-only execution, and disabled unrelated tools; domain classification adds an isolated temporary `CODEX_HOME` containing only an auth link and removes it on completion or interruption | Keeps model quality and execution behavior consistent across `ft wiki`, classification, Q&A, and other Codex-backed commands while keeping parallel domain workers independent of local customization |
+| Wiki compilation | Replaced serial page generation with an adaptive 20-worker scheduler, 60-worker ceiling, 80% CPU/RAM guard, three-attempt transient retry policy, serialized atomic state saves, process-group interruption, measured ETA, and the same five-line TUI as domain classification | Reduces the original one-LLM-call-per-page wall time without changing the model, reasoning effort, 50-bookmark sample, prompts, or markdown contract |
 | Process lifecycle | Added async engine invocation with scoped environment, abort signals, detached process-group termination, timeout escalation, bounded output buffers, and listener cleanup | Prevents interrupted or timed-out runs from leaving Codex descendants or temporary runtimes behind |
 | Terminal UX | Added a native five-line TTY display plus throttled ANSI-free redirected output | Makes rate, ETA, queue depth, worker target/cap, resource use, retries, failures, and the last error visible during long runs |
 | Run history | Appends JSONL summaries with throughput, concurrency, resource peaks, failure counts, and the last error; newly created logs use mode `0600` where supported | Supports evidence-based tuning across runs without adding telemetry |
@@ -142,6 +153,23 @@ This implementation was developed from the `afar1/fieldtheory-cli` baseline at c
 | Regression coverage | Added tests for planning under memory pressure, controller growth/decrease rules, parsing and prefill, failure classification, TTY/non-TTY rendering, and async engine cleanup; the build verifies schema packaging | Captures the performance and lifecycle invariants that are easiest to regress |
 
 The optimization does not change the bookmark database schema or the `ft classify-domains` command contract. Completed domains remain in the existing `domains` and `primary_domain` columns, so `ft domains`, `ft list --domain`, `ft viz`, exports, and the Mac app continue to consume the same data.
+
+##### Implementation map and maintenance invariants
+
+Use this map when changing or debugging the optimized paths:
+
+| Concern | Primary implementation | Contract to preserve |
+|---------|------------------------|----------------------|
+| Shared Codex invocation | `src/engine.ts` | Build every Codex call from the shared pinned profile; keep the prompt last; keep labels, cache keys, and provenance aligned with the resolved engine |
+| Domain orchestration | `src/bookmark-classify-llm.ts` | Commit valid partial results, retry only unfinished work, bound attempts, respect resource/service backpressure, and terminate scoped child processes on interruption |
+| Domain response contract | `src/domain-classification.schema.json` and `scripts/copy-build-assets.mjs` | Keep source and installed `dist` schema behavior equivalent; validate indices and normalized domain slugs before persistence |
+| Wiki orchestration | `src/md.ts` and `src/wiki-concurrency.ts` | Preserve prompts and the 50-bookmark sample, serialize state writes, retry only transient failures, and leave completed pages resumable after interruption |
+| Progress displays and command lifecycle | `src/cli.ts` | Keep TTY redraw bounded to five stable lines, redirected output ANSI-free and throttled, and signal handling graceful rather than an immediate process exit |
+| Browser selection | `src/config.ts` | Preserve precedence `--browser` > `FT_BROWSER` > Firefox; do not reintroduce ambient installed-browser detection as the default |
+
+Concurrency is an execution optimization, not a quality setting. Raising worker counts must not change the chosen model, reasoning effort, prompts, samples, JSON/page validation, or persistence format. Local CPU/RAM guardrails and remote timeout/throttle signals are independent: low CPU utilization is not evidence that the engine service can accept more requests. Any future controller change should therefore be tested for both resource pressure and service backpressure.
+
+The database and Library remain the source of truth. Domain workers write the existing bookmark columns through serialized database saves; wiki workers write pages atomically and serialize `md-state.json` updates. Run logs and the TUI are diagnostic surfaces only and must never be required to resume or consume processed data.
 
 ### Knowledge base
 
@@ -154,6 +182,22 @@ The optimization does not change the bookmark database schema or the `ft classif
 | `ft ask <question> --save` | Ask and save the answer as a concept page |
 | `ft lint` | Health-check the wiki for broken links and missing pages |
 | `ft lint --fix` | Auto-fix fixable wiki issues |
+
+#### Faster wiki compilation
+
+`ft wiki --engine codex` keeps the global `gpt-5.6-sol` / `ultra` / fast profile and the existing 50-bookmark sample for every page, but generates independent category, domain, and entity pages concurrently. The scheduler prefers 20 workers, may grow toward 60 after healthy completions, and applies the same 80% CPU/RAM guard used by domain classification. Timeouts and service throttling reduce concurrency and enter a cooldown instead of allowing a retry storm; transient page failures receive up to three attempts, while authentication and storage failures are terminal.
+
+Wiki pages and `md-state.json` are still written atomically and state updates are serialized, so concurrent completions cannot overwrite one another. Ctrl-C aborts every active engine process group, saves completed pages, and leaves the next run to resume the unfinished queue. The terminal display uses the same native five-line interface as `ft classify-domains`, including throughput, measured ETA, active/target/capped workers, peak concurrency, CPU/RAM, retries, and categorized failures. Redirected output is throttled and contains no ANSI escapes; detailed per-page events remain in `~/.fieldtheory/library/log.md`.
+
+Advanced controls:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FT_WIKI_INITIAL_CONCURRENCY` | `20` | Preferred starting worker count; resource limits may launch fewer |
+| `FT_WIKI_MAX_CONCURRENCY` | `60` | Local hard cap for wiki workers |
+| `FT_WIKI_SERVICE_MAX_CONCURRENCY` | `60` | Cap for an engine or account limit |
+| `FT_WIKI_WORKER_MEMORY_MB` | `128` | Estimated memory per worker for launch planning |
+| `FT_WIKI_TUNE_INTERVAL_MS` | `2000` | Resource sampling and auto-tuning interval |
 
 ### Possibility runs
 

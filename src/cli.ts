@@ -30,7 +30,7 @@ import {
 } from './bookmark-classify-llm.js';
 import { resolveEngine, detectAvailableEngines, normalizeCodexProfile } from './engine.js';
 import { loadPreferences, savePreferences } from './preferences.js';
-import { compileMd } from './md.js';
+import { compileMd, type CompileResult, type WikiProgress } from './md.js';
 import { cleanWikiFences } from './md-fence.js';
 import { askMd } from './md-ask.js';
 import { lintMd, fixLintIssues } from './md-lint.js';
@@ -363,6 +363,130 @@ export function createDomainProgressRenderer(stream: DomainOutputStream = proces
     render(true);
   };
   return { update, finish, fail };
+}
+
+export function createWikiProgressRenderer(stream: DomainOutputStream = process.stderr) {
+  const isTty = Boolean(stream.isTTY);
+  const useColor = isTty && !process.env.NO_COLOR;
+  const startedAt = Date.now();
+  let lastUpdateAt = startedAt;
+  let lastLogAt = 0;
+  let renderedLines = 0;
+  let spinnerIndex = 0;
+  let finished = false;
+  let stage = 'preparing';
+  let state: WikiProgress = {
+    engine: 'codex', done: 0, total: 0, created: 0, updated: 0,
+    failed: 0, retries: 0, activeWorkers: 0, targetConcurrency: 1,
+    concurrencyCap: 1, peakConcurrency: 0, elapsedSec: 0, etaSec: 0,
+    pagesPerMin: 0, cpuUsedPct: 0, memoryUsedPct: 0,
+    resourceLimitPct: 80, phase: 'preparing', currentPage: '',
+    failureCounts: { timeout: 0, throttle: 0, auth: 0, engine: 0, storage: 0, unexpected: 0 },
+  };
+  const number = (value: number) => Math.max(0, Math.round(value || 0)).toLocaleString('en-US');
+  const paint = (code: string, value: string) => useColor ? `\x1b[${code}m${value}\x1b[0m` : value;
+  const currentTimes = () => {
+    if (finished) return { elapsed: state.elapsedSec, eta: 0 };
+    const age = Math.max(0, (Date.now() - lastUpdateAt) / 1000);
+    return {
+      elapsed: Math.max((Date.now() - startedAt) / 1000, state.elapsedSec + age),
+      eta: Math.max(0, state.etaSec - age),
+    };
+  };
+  const plainLines = () => {
+    const width = Math.max(32, Number(stream.columns) || 100);
+    const done = Math.min(state.total || Infinity, state.done);
+    const ratio = state.total > 0 ? Math.min(1, done / state.total) : 0;
+    const pct = (ratio * 100).toFixed(1);
+    const barWidth = Math.max(8, Math.min(36, width - 52));
+    const filled = Math.round(ratio * barWidth);
+    const bar = '█'.repeat(filled) + '░'.repeat(Math.max(0, barWidth - filled));
+    const { elapsed, eta } = currentTimes();
+    const spin = state.phase === 'done' ? '✓' : DOMAIN_TUI_SPINNER[spinnerIndex++ % DOMAIN_TUI_SPINNER.length];
+    const otherFailures = state.failureCounts.auth + state.failureCounts.engine
+      + state.failureCounts.storage + state.failureCounts.unexpected;
+    const status = `${state.phase}${state.currentPage ? ` │ ${state.currentPage}` : stage ? ` │ ${stage}` : ''}`;
+    return [
+      clipDomainLine(`  ${spin} Field Theory · Wiki compilation │ ${state.engine}`, width),
+      clipDomainLine(`  [${bar}] ${pct}% │ ${number(done)}/${number(state.total)} │ ${number(Math.max(0, state.total - done))} left`, width),
+      clipDomainLine(`  created ${number(state.created)} │ updated ${number(state.updated)} │ failed ${number(state.failed)} │ retries ${number(state.retries)} │ timeout ${number(state.failureCounts.timeout)} throttle ${number(state.failureCounts.throttle)} other ${number(otherFailures)}`, width),
+      clipDomainLine(`  ${state.pagesPerMin.toFixed(1)}/min │ elapsed ${formatDomainDuration(elapsed)} │ ETA ${formatDomainDuration(eta)} │ workers ${state.activeWorkers}/${state.targetConcurrency}≤${state.concurrencyCap} peak ${state.peakConcurrency}`, width),
+      clipDomainLine(`  CPU ${state.cpuUsedPct.toFixed(0)}% │ RAM ${state.memoryUsedPct.toFixed(0)}%/${state.resourceLimitPct.toFixed(0)}% │ ${status}`, width),
+    ];
+  };
+  const renderTty = () => {
+    const lines = plainLines();
+    if (renderedLines > 0) stream.write(`\x1b[${renderedLines}A`);
+    lines.forEach((line, index) => {
+      const code = index === 0 ? '1;36' : (index === 1 && finished ? '1;32' : index >= 2 ? '2' : '0');
+      stream.write(`\x1b[2K${paint(code, line)}\n`);
+    });
+    renderedLines = lines.length;
+  };
+  const renderLog = (force = false) => {
+    const now = Date.now();
+    const urgent = ['failed', 'aborted', 'interrupted', 'done'].includes(state.phase);
+    if (force || urgent || lastLogAt === 0 || now - lastLogAt >= 10_000) {
+      lastLogAt = now;
+      const { elapsed, eta } = currentTimes();
+      stream.write(`Wiki ${number(state.done)}/${number(state.total)} (${state.total > 0 ? ((state.done / state.total) * 100).toFixed(1) : '0.0'}%) │ ${state.pagesPerMin.toFixed(1)}/min │ elapsed ${formatDomainDuration(elapsed)} │ ETA ${formatDomainDuration(eta)} │ workers ${state.activeWorkers}/${state.targetConcurrency}≤${state.concurrencyCap} peak ${state.peakConcurrency} │ CPU ${state.cpuUsedPct.toFixed(0)}% RAM ${state.memoryUsedPct.toFixed(0)}% │ retries ${state.retries} failed ${state.failed} │ ${state.phase}${state.currentPage ? ` │ ${state.currentPage}` : ''}\n`);
+    }
+  };
+  const render = (force = false) => isTty ? renderTty() : renderLog(force);
+  const timer = isTty ? setInterval(() => { if (!finished) renderTty(); }, 500) : null;
+  timer?.unref?.();
+  const stop = () => { if (timer) clearInterval(timer); };
+  return {
+    note(value: string) {
+      if (finished) return;
+      stage = value.replace(/\s+/g, ' ').trim();
+      render();
+    },
+    update(value: WikiProgress) {
+      if (finished) return;
+      state = value;
+      lastUpdateAt = Date.now();
+      render();
+    },
+    finish(result: CompileResult) {
+      if (finished) return;
+      state = {
+        ...state,
+        done: result.interrupted || result.aborted ? state.done : state.total,
+        created: result.pagesCreated,
+        updated: result.pagesUpdated,
+        failed: result.pagesFailed,
+        retries: result.retries,
+        activeWorkers: 0,
+        targetConcurrency: result.finalConcurrency,
+        concurrencyCap: result.concurrencyCap,
+        peakConcurrency: result.peakConcurrency,
+        elapsedSec: result.elapsed,
+        etaSec: 0,
+        cpuUsedPct: result.maxCpuUsedPct,
+        memoryUsedPct: result.maxMemoryUsedPct,
+        resourceLimitPct: result.resourceLimitPct,
+        failureCounts: result.failureCounts,
+        phase: result.interrupted ? 'interrupted' : result.aborted ? 'aborted' : 'done',
+        currentPage: '',
+      };
+      lastUpdateAt = Date.now();
+      finished = true;
+      stop();
+      render(true);
+    },
+    fail(error: unknown) {
+      if (finished) return;
+      state = {
+        ...state, activeWorkers: 0, phase: 'failed',
+        currentPage: error instanceof Error ? error.message : String(error),
+      };
+      lastUpdateAt = Date.now();
+      finished = true;
+      stop();
+      render(true);
+    },
+  };
 }
 
 async function classifyDomainsWithProgress(
@@ -2297,26 +2421,40 @@ export function buildCli() {
       }
 
       const start = Date.now();
+      const controller = new AbortController();
+      const wikiProgress = createWikiProgressRenderer(process.stderr);
       const onSigint = () => {
-        console.log('\n  Interrupted. Your data is safe — progress has been saved.');
-        console.log('  Run the same command again to pick up where you left off.\n');
-        process.exit(0);
+        controller.abort();
+        wikiProgress.note('Interrupting active workers and saving progress…');
       };
       process.once('SIGINT', onSigint);
       try {
-        const result = await compileMd({
-          full: options.full,
-          engineOverride: options.engine ? String(options.engine) : undefined,
-          onProgress: (s) => process.stderr.write(s + '\n'),
-        });
+        let result: CompileResult;
+        try {
+          result = await compileMd({
+            full: options.full,
+            engineOverride: options.engine ? String(options.engine) : undefined,
+            signal: controller.signal,
+            onProgress: (s) => wikiProgress.note(s),
+            onStatus: (status) => wikiProgress.update(status),
+          });
+          wikiProgress.finish(result);
+        } catch (error) {
+          wikiProgress.fail(error);
+          throw error;
+        }
         const elapsed = ((Date.now() - start) / 1000).toFixed(1);
         const failed = result.pagesFailed > 0 ? ` failed=${result.pagesFailed}` : '';
-        if (result.aborted) {
+        if (result.interrupted) {
+          console.log(`Interrupted (${elapsed}s) — created=${result.pagesCreated} updated=${result.pagesUpdated} retries=${result.retries}`);
+          console.log('\n  Your data is safe and active model workers were stopped.');
+          console.log('  Run the same command again to resume.\n');
+        } else if (result.aborted) {
           console.log(`Aborted (${elapsed}s) — engine=${result.engine} created=${result.pagesCreated} updated=${result.pagesUpdated}${failed}`);
           console.log(`\n  Too many consecutive failures. Check that \`${result.engine}\` is authenticated and not rate-limited, then rerun \`ft wiki\`.`);
           process.exitCode = 1;
         } else {
-          console.log(`Done (${elapsed}s) — engine=${result.engine} created=${result.pagesCreated} updated=${result.pagesUpdated} skipped=${result.pagesSkipped}${failed} total=${result.totalPages}`);
+          console.log(`Done (${elapsed}s) — engine=${result.engine} created=${result.pagesCreated} updated=${result.pagesUpdated} skipped=${result.pagesSkipped}${failed} retries=${result.retries} workers=${result.initialConcurrency}->${result.finalConcurrency} peak=${result.peakConcurrency} total=${result.totalPages}`);
           if (result.pagesFailed > 0) {
             console.log(`\n  ${result.pagesFailed} page(s) failed — re-run ft wiki to retry them.`);
           }
