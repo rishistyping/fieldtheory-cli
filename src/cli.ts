@@ -22,7 +22,12 @@ import {
   getBookmarkById,
 } from './bookmarks-db.js';
 import { formatClassificationSummary } from './bookmark-classify.js';
-import { classifyWithLlm, classifyDomainsWithLlm } from './bookmark-classify-llm.js';
+import {
+  classifyWithLlm,
+  classifyDomainsWithLlm,
+  type DomainClassifyResult,
+  type DomainProgress,
+} from './bookmark-classify-llm.js';
 import { resolveEngine, detectAvailableEngines } from './engine.js';
 import { loadPreferences, savePreferences } from './preferences.js';
 import { compileMd } from './md.js';
@@ -203,6 +208,174 @@ export async function runWithSpinner<T>(
     return await fn();
   } finally {
     spinner.stop();
+  }
+}
+
+const DOMAIN_TUI_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+interface DomainOutputStream {
+  isTTY?: boolean;
+  columns?: number;
+  write(value: string): unknown;
+}
+
+function formatDomainDuration(value: number): string {
+  const seconds = Math.max(0, Math.round(Number(value) || 0));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, '0')}m`;
+  if (minutes > 0) return `${minutes}m ${String(rest).padStart(2, '0')}s`;
+  return `${rest}s`;
+}
+
+function clipDomainLine(value: string, width: number): string {
+  const chars = Array.from(value);
+  if (chars.length <= width) return value;
+  if (width <= 1) return chars.slice(0, width).join('');
+  return `${chars.slice(0, width - 1).join('')}…`;
+}
+
+export function createDomainProgressRenderer(stream: DomainOutputStream = process.stderr) {
+  const isTty = Boolean(stream.isTTY);
+  const useColor = isTty && !process.env.NO_COLOR;
+  const startedAt = Date.now();
+  let lastUpdateAt = startedAt;
+  let lastLogAt = 0;
+  let renderedLines = 0;
+  let spinnerIndex = 0;
+  let finished = false;
+  let state: DomainProgress = {
+    done: 0, total: 0, classified: 0, failed: 0, prefilled: 0,
+    engine: 'codex', concurrency: 1, concurrencyCap: 1, peakConcurrency: 0,
+    activeWorkers: 0, queuedBatches: 0, elapsedSec: 0, etaSec: 0,
+    itemsPerMin: 0, successBatches: 0, nextBatchSize: 200,
+    cpuUsedPct: 0, memoryUsedPct: 0, maxCpuUsedPct: 0, maxMemoryUsedPct: 0,
+    throttleEvents: 0, resourceLimitPct: 80, batchIndex: 0,
+    batchSizeUsed: 0, batchClassified: 0, batchFailed: 0, batchSec: 0,
+    lastError: '', ok: true, phase: 'starting', attempt: 0,
+  };
+  const number = (value: number) => Math.max(0, Math.round(Number(value) || 0)).toLocaleString('en-US');
+  const paint = (code: string, value: string) => useColor ? `\x1b[${code}m${value}\x1b[0m` : value;
+  const currentTimes = () => {
+    if (finished) return { elapsed: state.elapsedSec, eta: 0 };
+    const age = Math.max(0, (Date.now() - lastUpdateAt) / 1000);
+    return {
+      elapsed: Math.max((Date.now() - startedAt) / 1000, state.elapsedSec + age),
+      eta: Math.max(0, state.etaSec - age),
+    };
+  };
+  const plainLines = () => {
+    const width = Math.max(32, Number(stream.columns) || 100);
+    const done = Math.min(state.total || Infinity, state.done);
+    const ratio = state.total > 0 ? Math.min(1, done / state.total) : 0;
+    const pct = (ratio * 100).toFixed(1);
+    const barWidth = Math.max(8, Math.min(36, width - 52));
+    const filled = Math.round(ratio * barWidth);
+    const bar = '█'.repeat(filled) + '░'.repeat(Math.max(0, barWidth - filled));
+    const { elapsed, eta } = currentTimes();
+    const spin = state.phase === 'done' ? '✓' : DOMAIN_TUI_SPINNER[spinnerIndex++ % DOMAIN_TUI_SPINNER.length];
+    const batchTime = state.phase === 'running'
+      ? Math.max(state.batchSec, (Date.now() - lastUpdateAt) / 1000)
+      : state.batchSec;
+    const status = state.lastError
+      ? `${state.phase}: ${state.lastError.replace(/\s+/g, ' ').trim()}`
+      : state.phase;
+    return [
+      clipDomainLine(`  ${spin} Field Theory · Domain classification │ ${state.engine}`, width),
+      clipDomainLine(`  [${bar}] ${pct}% │ ${number(done)}/${number(state.total)} │ ${number(Math.max(0, state.total - done))} left`, width),
+      clipDomainLine(`  classified ${number(state.classified)} │ category prefill ${number(state.prefilled)} │ failed ${number(state.failed)}`, width),
+      clipDomainLine(`  ${state.itemsPerMin.toFixed(1)}/min │ elapsed ${formatDomainDuration(elapsed)} │ ETA ${formatDomainDuration(eta)} │ workers ${state.activeWorkers}/${state.concurrency}≤${state.concurrencyCap} peak ${state.peakConcurrency} │ queued ${state.queuedBatches}`, width),
+      clipDomainLine(`  CPU ${state.cpuUsedPct.toFixed(0)}% │ RAM ${state.memoryUsedPct.toFixed(0)}%/${state.resourceLimitPct.toFixed(0)}% │ batch #${state.batchIndex || '—'} ${number(state.batchSizeUsed)} items +${number(state.batchClassified)}/-${number(state.batchFailed)} ${batchTime.toFixed(1)}s │ ${status}`, width),
+    ];
+  };
+  const renderTty = () => {
+    const lines = plainLines();
+    if (renderedLines > 0) stream.write(`\x1b[${renderedLines}A`);
+    lines.forEach((line, index) => {
+      const code = index === 0 ? '1;36' : (index === 1 && finished ? '1;32' : index >= 2 ? '2' : '0');
+      stream.write(`\x1b[2K${paint(code, line)}\n`);
+    });
+    renderedLines = lines.length;
+  };
+  const renderLog = (force = false) => {
+    const now = Date.now();
+    const urgent = ['failed', 'retrying', 'done'].includes(state.phase);
+    if (!force && !urgent && lastLogAt > 0 && now - lastLogAt < 10_000) return;
+    lastLogAt = now;
+    const { elapsed, eta } = currentTimes();
+    stream.write(`Domains ${number(state.done)}/${number(state.total)} (${state.total > 0 ? ((state.done / state.total) * 100).toFixed(1) : '0.0'}%) │ ${state.itemsPerMin.toFixed(1)}/min │ elapsed ${formatDomainDuration(elapsed)} │ ETA ${formatDomainDuration(eta)} │ workers ${number(state.activeWorkers)}/${number(state.concurrency)}≤${number(state.concurrencyCap)} │ CPU ${state.cpuUsedPct.toFixed(0)}% RAM ${state.memoryUsedPct.toFixed(0)}% │ queued ${number(state.queuedBatches)} │ ${state.phase}\n`);
+  };
+  const render = (force = false) => isTty ? renderTty() : renderLog(force);
+  const timer = isTty ? setInterval(() => { if (!finished) renderTty(); }, 500) : null;
+  timer?.unref?.();
+  const update = (progress: DomainProgress) => {
+    if (finished) return;
+    state = { ...state, ...progress };
+    lastUpdateAt = Date.now();
+    render();
+  };
+  const stopTimer = () => { if (timer) clearInterval(timer); };
+  const finish = (result: DomainClassifyResult) => {
+    if (finished) return;
+    state = {
+      ...state,
+      engine: result.engine,
+      total: result.totalUnclassified,
+      classified: result.classified,
+      failed: result.failed,
+      done: result.classified + result.failed,
+      prefilled: result.prefilled,
+      concurrency: result.finalConcurrency,
+      concurrencyCap: result.concurrencyCap,
+      peakConcurrency: result.peakConcurrency,
+      activeWorkers: 0,
+      queuedBatches: 0,
+      elapsedSec: result.elapsedSec,
+      etaSec: 0,
+      cpuUsedPct: result.maxCpuUsedPct,
+      memoryUsedPct: result.maxMemoryUsedPct,
+      resourceLimitPct: result.resourceLimitPct,
+      throttleEvents: result.throttleEvents,
+      phase: 'done',
+      ok: result.failed === 0,
+    };
+    lastUpdateAt = Date.now();
+    finished = true;
+    stopTimer();
+    render(true);
+  };
+  const fail = (error: unknown) => {
+    if (finished) return;
+    state = {
+      ...state, phase: 'failed', ok: false,
+      lastError: error instanceof Error ? error.message : String(error), activeWorkers: 0,
+    };
+    lastUpdateAt = Date.now();
+    finished = true;
+    stopTimer();
+    render(true);
+  };
+  return { update, finish, fail };
+}
+
+async function classifyDomainsWithProgress(
+  options: Parameters<typeof classifyDomainsWithLlm>[0],
+): Promise<DomainClassifyResult> {
+  const progress = createDomainProgressRenderer(process.stderr);
+  try {
+    const result = await classifyDomainsWithLlm({
+      ...options,
+      onBatch: info => {
+        progress.update(info);
+        options.onBatch?.(info);
+      },
+    });
+    progress.finish(result);
+    return result;
+  } catch (error) {
+    progress.fail(error);
+    throw error;
   }
 }
 
@@ -795,16 +968,10 @@ export function buildCli() {
       process.stderr.write(`  \u2713 ${catResult.classified} categorized\n`);
     }
 
-    const domStart = Date.now();
     process.stderr.write('  Classifying new bookmarks (domains)...\n');
-    const domResult = await classifyDomainsWithLlm({
+    const domResult = await classifyDomainsWithProgress({
       engine,
       all: false,
-      onBatch: (done: number, total: number) => {
-        const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-        const elapsed = Math.round((Date.now() - domStart) / 1000);
-        process.stderr.write(`  Domains: ${done}/${total} (${pct}%) \u2502 ${elapsed}s elapsed\n`);
-      },
     });
     if (domResult.classified > 0) {
       process.stderr.write(`  \u2713 ${domResult.classified} domains assigned\n`);
@@ -1371,16 +1538,10 @@ export function buildCli() {
         console.log(`\nEngine: ${catResult.engine}`);
         console.log(`Categories: ${catResult.classified}/${catResult.totalUnclassified} classified`);
 
-        let domStart = Date.now();
-        process.stderr.write('\nClassifying domains with LLM (batches of 50, ~2 min per batch)...\n');
-        const domResult = await classifyDomainsWithLlm({
+        process.stderr.write('\nClassifying domains with LLM (dynamic batches and workers)...\n');
+        const domResult = await classifyDomainsWithProgress({
           engine,
           all: false,
-          onBatch: (done: number, total: number) => {
-            const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-            const elapsed = Math.round((Date.now() - domStart) / 1000);
-            process.stderr.write(`  Domains: ${done}/${total} (${pct}%) \u2502 ${elapsed}s elapsed\n`);
-          },
         });
         console.log(`\nDomains: ${domResult.classified}/${domResult.totalUnclassified} classified`);
       }
@@ -1396,16 +1557,10 @@ export function buildCli() {
     .action(safe(async (options) => {
       if (!requireData()) return;
       const engine = await resolveEngine({ override: options.engine ? String(options.engine) : undefined });
-      const start = Date.now();
-      process.stderr.write('Classifying bookmark domains with LLM (batches of 50, ~2 min per batch)...\n');
-      const result = await classifyDomainsWithLlm({
+      process.stderr.write('Classifying bookmark domains with LLM (dynamic batches and workers)...\n');
+      const result = await classifyDomainsWithProgress({
         engine,
         all: options.all ?? false,
-        onBatch: (done: number, total: number) => {
-          const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-          const elapsed = Math.round((Date.now() - start) / 1000);
-          process.stderr.write(`  Domains: ${done}/${total} (${pct}%) \u2502 ${elapsed}s elapsed\n`);
-        },
       });
       console.log(`\nDomains: ${result.classified}/${result.totalUnclassified} classified`);
     }));

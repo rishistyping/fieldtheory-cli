@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "properties": {
+    "r": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "i": { "type": "integer" },
+          "d": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": ["i", "d"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["r"],
+  "additionalProperties": false
+}
