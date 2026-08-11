@@ -9,7 +9,15 @@
 import { openDb, saveDb } from './db.js';
 import { twitterBookmarksIndexPath } from './paths.js';
 import type { ResolvedEngine } from './engine.js';
-import { EngineInvocationError, invokeEngine, invokeEngineAsync } from './engine.js';
+import {
+  buildCodexArgs,
+  CODEX_EFFORT,
+  CODEX_ENGINE_LABEL,
+  CODEX_MODEL,
+  EngineInvocationError,
+  invokeEngine,
+  invokeEngineAsync,
+} from './engine.js';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -623,28 +631,16 @@ export function inferCategoryDomain(categories: string | null): string | null {
   return KNOWN_DOMAINS.has(domain) ? domain : null;
 }
 
-function optimizedDomainEngine(engine: ResolvedEngine): ResolvedEngine {
+function domainEngineWithSchema(engine: ResolvedEngine): ResolvedEngine {
   if (engine.name !== 'codex') return engine;
   return {
     ...engine,
-    model: 'gpt-5.6-sol',
-    effort: 'ultra',
-    label: 'codex/gpt-5.6-sol/effort=ultra/fast',
+    model: CODEX_MODEL,
+    effort: CODEX_EFFORT,
+    label: CODEX_ENGINE_LABEL,
     config: {
       ...engine.config,
-      args: (prompt: string) => [
-        'exec', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules',
-        '--model', 'gpt-5.6-sol',
-        '--config', 'model_reasoning_effort="ultra"',
-        '--config', 'service_tier="fast"',
-        '--enable', 'fast_mode', '--config', 'mcp_servers={}',
-        '--config', 'project_doc_max_bytes=0', '--config', 'web_search="disabled"',
-        '--disable', 'apps', '--disable', 'goals', '--disable', 'hooks',
-        '--disable', 'multi_agent', '--disable', 'shell_tool', '--disable', 'plugins',
-        '--disable', 'plugin_sharing', '--disable', 'skill_mcp_dependency_install',
-        '--sandbox', 'read-only', '--color', 'never',
-        '--output-schema', DOMAIN_OUTPUT_SCHEMA, prompt,
-      ],
+      args: (prompt: string) => buildCodexArgs(prompt, ['--output-schema', DOMAIN_OUTPUT_SCHEMA]),
     },
   };
 }
@@ -698,7 +694,7 @@ export async function classifyDomainsWithLlm(options: {
   onBatch?: (progress: DomainProgress) => void;
 }): Promise<DomainClassifyResult> {
   const { engine } = options;
-  const domainEngine = optimizedDomainEngine(engine);
+  const domainEngine = domainEngineWithSchema(engine);
   const plan = getDomainConcurrencyPlan();
   const domainBatchSize = numericEnv('FT_DOMAIN_BATCH_SIZE', DOMAIN_BATCH_SIZE, 25, 200);
   const domainTimeoutMs = numericEnv('FT_DOMAIN_TIMEOUT_MS', 180_000, 1_000, 600_000);

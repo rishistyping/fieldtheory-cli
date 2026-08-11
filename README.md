@@ -85,13 +85,17 @@ On first run, `ft sync` extracts your X session from your browser and downloads 
 | `ft classify --engine <name>` | Override the LLM engine for one run (also works on `ft sync --classify` and `ft classify-domains`) |
 | `ft model` | View or change the default LLM engine |
 
+#### Global Codex profile
+
+Every Field Theory Codex invocation is pinned to `gpt-5.6-sol` with `ultra` reasoning and the fast service tier. Codex runs are ephemeral and read-only, ignore user/project instructions, and disable unrelated tools and integrations. This includes `ft wiki --engine codex`, `ft classify --engine codex`, `ft ask`, and other Field Theory features that resolve Codex. Field Theory does not inherit a different model or reasoning effort from the normal Codex configuration for these calls. Claude keeps its normal engine resolution.
+
 #### Faster domain classification
 
 `ft classify-domains` runs independent LLM batches concurrently and adjusts the worker count while it runs. The default plan prefers 20 workers, uses batches of 100 bookmarks, and may grow to 60 workers after sustained healthy completions. Available memory, CPU count, current CPU/RAM use, and the service cap can lower either the launch count or the live target. CPU or RAM at 80% activates the resource guard; healthy growth only occurs below 70% CPU and 75% RAM. These are safety limits, so a constrained machine may start below 20 workers.
 
 The controller keeps successful classifications, retries only missing or failed work up to three attempts, and applies exponential backoff when the engine is throttled or unavailable. Timeouts and invalid responses reduce concurrency and split failed batches larger than 25 in half; storage errors fail immediately instead of being retried. Successful partial results are committed before omitted items are retried, so a weak response does not discard valid classifications.
 
-Codex domain runs are deliberately pinned to `gpt-5.6-sol` with `ultra` reasoning and the fast service tier. They use an ephemeral, read-only Codex process with unrelated tools and integrations disabled. Other configured engines keep their normal engine resolution. All engines receive the compact subject-classification prompt; Codex additionally enforces the packaged JSON output schema.
+Domain classification additionally uses the compact subject-classification prompt, the packaged Codex JSON output schema, and a temporary isolated Codex home.
 
 On an interactive terminal, the native progress display shows throughput and ETA, active/target/capped workers, queued batches, CPU and RAM, peak concurrency, retry state, categorized failures, and the most recent error. Redirected output uses throttled, ANSI-free progress lines instead. Each completed run also appends a local JSONL record to `~/.fieldtheory/bookmarks/domain-classify-runs.jsonl` so performance and failures can be compared between runs. Newly created log files use mode `0600` where supported.
 
@@ -129,7 +133,7 @@ This implementation was developed from the `afar1/fieldtheory-cli` baseline at c
 | Prompt efficiency | Sends compact indexed JSON records, clips very long bookmark text, marks bookmark fields as untrusted, and maps output indices back to bookmark IDs | Reduces token and serialization overhead without letting bookmark content become instructions |
 | Output quality | Requests one result per input, enforces the response container/item shape with a packaged Codex JSON schema, validates compact domain slugs, rejects duplicate/out-of-range results, and retains the primary domain first | Preserves classification structure at higher concurrency and makes omitted or malformed output retryable |
 | Category prefill | Reuses a single unambiguous known subject category as the domain, but does not prefill format-only or ambiguous multi-subject categories | Avoids unnecessary LLM calls without guessing when evidence is ambiguous |
-| Codex isolation | Uses an isolated temporary `CODEX_HOME` containing only an auth link, ignores user/project configuration, disables tools not needed for classification, and removes the runtime directory on completion or interruption | Reduces startup/context overhead and keeps parallel workers independent of local Codex customization |
+| Global Codex profile | All Field Theory Codex calls use `gpt-5.6-sol`, `ultra` reasoning, the fast tier, ephemeral/read-only execution, and disabled unrelated tools; domain classification adds an isolated temporary `CODEX_HOME` containing only an auth link and removes it on completion or interruption | Keeps model quality and execution behavior consistent across `ft wiki`, classification, Q&A, and other Codex-backed commands while keeping parallel domain workers independent of local customization |
 | Process lifecycle | Added async engine invocation with scoped environment, abort signals, detached process-group termination, timeout escalation, bounded output buffers, and listener cleanup | Prevents interrupted or timed-out runs from leaving Codex descendants or temporary runtimes behind |
 | Terminal UX | Added a native five-line TTY display plus throttled ANSI-free redirected output | Makes rate, ETA, queue depth, worker target/cap, resource use, retries, failures, and the last error visible during long runs |
 | Run history | Appends JSONL summaries with throughput, concurrency, resource peaks, failure counts, and the last error; newly created logs use mode `0600` where supported | Supports evidence-based tuning across runs without adding telemetry |

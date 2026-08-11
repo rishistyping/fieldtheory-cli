@@ -28,7 +28,7 @@ import {
   type DomainClassifyResult,
   type DomainProgress,
 } from './bookmark-classify-llm.js';
-import { resolveEngine, detectAvailableEngines } from './engine.js';
+import { resolveEngine, detectAvailableEngines, normalizeCodexProfile } from './engine.js';
 import { loadPreferences, savePreferences } from './preferences.js';
 import { compileMd } from './md.js';
 import { cleanWikiFences } from './md-fence.js';
@@ -2487,8 +2487,8 @@ export function buildCli() {
     .option('--frame <id>', 'Frame id (overrides any frame pinned on the seed)')
     .option('--depth <depth>', 'Depth: quick | standard | deep (default: standard, or quick under --defaults)')
     .option('--engine <name>', 'LLM CLI engine for this run (claude | codex; default comes from ft model/autodetect)')
-    .option('--model <name>', 'Model alias/name passed to the engine (for example opus or gpt-5.5)')
-    .option('--effort <level>', 'Reasoning effort passed to the engine (low | medium | high | xhigh | max)')
+    .option('--model <name>', 'Claude model alias/name; Codex is pinned to gpt-5.6-sol')
+    .option('--effort <level>', 'Claude reasoning effort; Codex is pinned to ultra')
     .option('--weight <level>', 'Alias for --effort', undefined)
     .option('--nodes <n>', 'Number of nodes/debates to generate per repo (default comes from --depth)')
     .option('--steering <text>', 'Optional steering nudge')
@@ -2561,15 +2561,18 @@ export function buildCli() {
       const seedFrameId = seedId ? readIdeasSeed(seedId)?.frameId : undefined;
       const frameId = validateOptionalFrameId(resolveFrameIdForRun(explicitFrameId, seedFrameId))!;
 
+      const engineProfile = normalizeCodexProfile({
+        engine: options.engine ? String(options.engine).trim() : undefined,
+        model: options.model ? String(options.model).trim() : undefined,
+        effort: effort || weight,
+      });
       const plan = {
         seedArtifactIds,
         seedId,
         repos,
         frameId,
         depth,
-        engine: options.engine ? String(options.engine).trim() : undefined,
-        model: options.model ? String(options.model).trim() : undefined,
-        effort: effort || weight,
+        ...engineProfile,
         nodeTarget,
         steering: options.steering ? String(options.steering) : undefined,
       };
@@ -2649,8 +2652,8 @@ export function buildCli() {
     .option('--frame <id>', 'Frame id (defaults to seed-pinned frame or leverage-specificity)')
     .option('--depth <depth>', 'Depth: quick | standard | deep', 'quick')
     .option('--engine <name>', 'LLM CLI engine for this run (claude | codex)')
-    .option('--model <name>', 'Model alias/name passed to the engine')
-    .option('--effort <level>', 'Reasoning effort passed to the engine')
+    .option('--model <name>', 'Claude model alias/name; Codex is pinned to gpt-5.6-sol')
+    .option('--effort <level>', 'Claude reasoning effort; Codex is pinned to ultra')
     .option('--weight <level>', 'Alias for --effort', undefined)
     .option('--nodes <n>', 'Number of nodes/debates to generate per repo')
     .option('--steering <text>', 'Optional steering nudge')
@@ -2700,6 +2703,11 @@ export function buildCli() {
         return;
       }
 
+      const engineProfile = normalizeCodexProfile({
+        engine: options.engine ? String(options.engine).trim() : undefined,
+        model: options.model ? String(options.model).trim() : undefined,
+        effort: effort || weight,
+      });
       const plan: IdeasNightlyPlan = {
         defaults,
         seedArtifactIds,
@@ -2707,9 +2715,7 @@ export function buildCli() {
         repos: repoResolution.kind === 'ok' ? repoResolution.repos : undefined,
         frameId: validateOptionalFrameId(options.frame),
         depth,
-        engine: options.engine ? String(options.engine).trim() : undefined,
-        model: options.model ? String(options.model).trim() : undefined,
-        effort: effort || weight,
+        ...engineProfile,
         nodeTarget: validateNodeTarget(options.nodes),
         steering: options.steering ? String(options.steering) : undefined,
       };
